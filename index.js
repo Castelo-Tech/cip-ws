@@ -1,184 +1,201 @@
-// Minimal multi-session WA server (ESM) with LocalAuth persistence on VM disk.
-// Features:
-// - Create/init sessions on demand (QR flow) → /init?session=session-a
-// - Query status/QR → /status?session=… , /qr?session=…
-// - Send text → POST /send { sessionId, chatId, body }
-// - Single WS hub → ws://host:3001/ws[?sessionId=…] (events include sessionId)
-//
-// Start: npm install && npm start
+// Main wiring: REST + WS, Firebase Admin auth, Firestore ACL/RBAC.
+// No messaging endpoints. Sessions are per-account and per-label.
+// Each WS connection binds to *one* accountId and is ACL-filtered.
 
+// ---------- core ----------
 import express from 'express';
 import cors from 'cors';
 import http from 'http';
-import fs from 'fs';
-import path from 'path';
-import { fileURLToPath } from 'url';
-import { WebSocketServer } from 'ws';
-import wwebjs from 'whatsapp-web.js';
-const { Client, LocalAuth } = wwebjs;
+
+// ---------- firebase admin ----------
+import { initializeApp, applicationDefault } from 'firebase-admin/app';
+import { getAuth } from 'firebase-admin/auth';
+import { getFirestore } from 'firebase-admin/firestore';
+
+// ---------- local modules ----------
+import { createMetadata } from './lib/metadata.js';
+import { createRbac } from './lib/rbac.js';
+import { createSessionManager } from './lib/sessionManager.js';
+import { createWsHub } from './lib/wsHub.js';
+import { createSessionRegistry } from './lib/sessionRegistry.js';
 
 const PORT = 3001;
-const __filename = fileURLToPath(import.meta.url);
-const __dirname  = path.dirname(__filename);
 
-// ---- basic app ----
+// ---------- Firebase Admin init (uses GCE ADC) ----------
+initializeApp({ credential: applicationDefault() });
+const db = getFirestore();
+const authAdmin = getAuth();
+
+// ---------- Express ----------
 const app = express();
 app.use(express.json());
-app.use(cors({ origin: '*', methods: ['GET','POST','OPTIONS'], allowedHeaders: ['Content-Type'] }));
-app.options('*', (req, res) => res.sendStatus(204));
+app.use(cors({ origin: '*', methods: ['GET','POST','DELETE','OPTIONS'], allowedHeaders: ['Content-Type', 'Authorization'] }));
+app.options('*', (_req, res) => res.sendStatus(204));
 
-// ---- data path for LocalAuth (persists on this VM) ----
-const DATA_PATH = path.join(__dirname, '.wwebjs_auth');
-if (!fs.existsSync(DATA_PATH)) fs.mkdirSync(DATA_PATH, { recursive: true });
+// ---------- Utilities ----------
+const meta = createMetadata();
+const rbac = createRbac({ db });
+const registry = createSessionRegistry({ db });
+const sessions = createSessionManager({ dataPath: './.wwebjs_auth', registry }); // WA LocalAuth + Firestore registry
 
-// ---- WS hub (subscribe to "*" or a specific sessionId) ----
+// Helper: bearer token → Firebase user (uid)
+async function requireUser(req, res, next) {
+  try {
+    const hdr = String(req.headers.authorization || '');
+    const token = hdr.startsWith('Bearer ') ? hdr.slice(7) : '';
+    if (!token) return res.status(401).json({ error: 'missing Authorization Bearer token' });
+    const decoded = await authAdmin.verifyIdToken(token);
+    req.user = { uid: decoded.uid, email: decoded.email || null };
+    next();
+  } catch (e) {
+    return res.status(401).json({ error: 'invalid token' });
+  }
+}
+
+// ---------- REST: Server self-assign to account.wsServer ----------
+app.post('/admin/assignServer', requireUser, async (req, res) => {
+  const { accountId, labels = {} } = req.body || {};
+  if (!accountId) return res.status(400).json({ error: 'accountId required' });
+
+  // admin check
+  const role = await rbac.getRole(accountId, req.user.uid);
+  if (role !== 'Administrator') return res.status(403).json({ error: 'not an Administrator' });
+
+  // gather VM meta
+  const [ip, name, zone, project] = await Promise.all([
+    meta.externalIp(),
+    meta.instanceName(),
+    meta.zone(),
+    meta.projectId()
+  ]);
+
+  await db.collection('accounts').doc(accountId).set({
+    wsServer: {
+      assignedAt: new Date(),
+      ip, instance: name, zone, project,
+      labels: Object(labels)
+    }
+  }, { merge: true });
+
+  res.json({ ok: true, accountId, wsServer: { ip, instance: name, zone, project, labels } });
+});
+
+// ---------- REST: Sessions (Admin) ----------
+app.get('/sessions', requireUser, async (req, res) => {
+  const accountId = String(req.query.accountId || '');
+  if (!accountId) return res.status(400).json({ error: 'accountId required' });
+
+  // member check (any role can list)
+  const role = await rbac.getRole(accountId, req.user.uid);
+  if (!role) return res.status(403).json({ error: 'not a member' });
+
+  res.json(await registry.list(accountId));
+});
+
+app.post('/sessions/init', requireUser, async (req, res) => {
+  const { accountId, label } = req.body || {};
+  if (!accountId || !label) return res.status(400).json({ error: 'accountId, label required' });
+
+  const role = await rbac.getRole(accountId, req.user.uid);
+  if (role !== 'Administrator') return res.status(403).json({ error: 'not an Administrator' });
+
+  sessions.init({ accountId, label });
+  res.json({ ok: true, accountId, label, status: sessions.status({ accountId, label }) || 'starting' });
+});
+
+app.post('/sessions/stop', requireUser, async (req, res) => {
+  const { accountId, label } = req.body || {};
+  if (!accountId || !label) return res.status(400).json({ error: 'accountId, label required' });
+
+  const role = await rbac.getRole(accountId, req.user.uid);
+  if (role !== 'Administrator') return res.status(403).json({ error: 'not an Administrator' });
+
+  await sessions.stop({ accountId, label });
+  res.json({ ok: true, accountId, label, status: sessions.status({ accountId, label }) || 'stopped' });
+});
+
+app.post('/sessions/destroy', requireUser, async (req, res) => {
+  const { accountId, label } = req.body || {};
+  if (!accountId || !label) return res.status(400).json({ error: 'accountId, label required' });
+
+  const role = await rbac.getRole(accountId, req.user.uid);
+  if (role !== 'Administrator') return res.status(403).json({ error: 'not an Administrator' });
+
+  await sessions.destroy({ accountId, label });
+  res.json({ ok: true, accountId, label });
+});
+
+app.get('/status', requireUser, async (req, res) => {
+  const accountId = String(req.query.accountId || '');
+  const label     = String(req.query.label || req.query.session || '');
+  if (!accountId || !label) return res.status(400).json({ error: 'accountId, label required' });
+
+  const role = await rbac.getRole(accountId, req.user.uid);
+  if (!role) return res.status(403).json({ error: 'not a member' });
+
+  res.json({
+    accountId, label,
+    status: sessions.status({ accountId, label }),
+    waId: await registry.getWaId(accountId, label)
+  });
+});
+
+app.get('/qr', requireUser, async (req, res) => {
+  const accountId = String(req.query.accountId || '');
+  const label     = String(req.query.label || req.query.session || '');
+  if (!accountId || !label) return res.status(400).json({ error: 'accountId, label required' });
+
+  const role = await rbac.getRole(accountId, req.user.uid);
+  if (!role) return res.status(403).json({ error: 'not a member' });
+
+  res.json({ accountId, label, qr: sessions.qr({ accountId, label }) || null });
+});
+
+// ---------- REST: ACL (Admin manages per-account ACL docs) ----------
+app.get('/acl/users', requireUser, async (req, res) => {
+  const accountId = String(req.query.accountId || '');
+  if (!accountId) return res.status(400).json({ error: 'accountId required' });
+
+  const role = await rbac.getRole(accountId, req.user.uid);
+  if (role !== 'Administrator') return res.status(403).json({ error: 'not an Administrator' });
+
+  res.json(await rbac.listAcl(accountId));
+});
+
+app.post('/acl/grant', requireUser, async (req, res) => {
+  const { accountId, uid, sessions: allowed } = req.body || {};
+  if (!accountId || !uid || !Array.isArray(allowed) || !allowed.length)
+    return res.status(400).json({ error: 'accountId, uid, sessions[] required' });
+
+  const role = await rbac.getRole(accountId, req.user.uid);
+  if (role !== 'Administrator') return res.status(403).json({ error: 'not an Administrator' });
+
+  await rbac.setAcl(accountId, uid, allowed);
+  res.json({ ok: true });
+});
+
+app.post('/acl/revoke', requireUser, async (req, res) => {
+  const { accountId, uid } = req.body || {};
+  if (!accountId || !uid) return res.status(400).json({ error: 'accountId, uid required' });
+
+  const role = await rbac.getRole(accountId, req.user.uid);
+  if (role !== 'Administrator') return res.status(403).json({ error: 'not an Administrator' });
+
+  await rbac.setAcl(accountId, uid, []);
+  res.json({ ok: true });
+});
+
+// ---------- WS hub (auth via token + Firestore ACL; live ACL updates) ----------
 const server = http.createServer(app);
-const wss = new WebSocketServer({ noServer: true });
-const subscribers = new Map(); // channel -> Set<ws>
-
-function sub(channel, ws) {
-  if (!subscribers.has(channel)) subscribers.set(channel, new Set());
-  subscribers.get(channel).add(ws);
-  ws.on('close', () => subscribers.get(channel)?.delete(ws));
-}
-function pub(channel, payload) {
-  const msg = JSON.stringify(payload);
-  subscribers.get(channel)?.forEach(ws => ws.readyState === ws.OPEN && ws.send(msg));
-  subscribers.get('*')?.forEach(ws => ws.readyState === ws.OPEN && ws.send(msg));
-}
-server.on('upgrade', (req, socket, head) => {
-  const url = new URL(req.url || '', 'http://x');
-  if (url.pathname !== '/ws') return socket.destroy();
-  const sessionId = url.searchParams.get('sessionId'); // optional
-  wss.handleUpgrade(req, socket, head, (ws) => {
-    sub(sessionId || '*', ws);
-    ws.send(JSON.stringify({ type: 'hello', ts: Date.now(), sessionId: sessionId || '*' }));
-  });
+createWsHub({
+  server,
+  authAdmin,
+  rbac,
+  sessions,     // for event stream
+  maxConnections: 2000
 });
 
-// ---- multi-session state ----
-const clients = new Map();       // sessionId -> Client
-const status  = new Map();       // sessionId -> 'idle'|'starting'|'scanning'|'ready'|'disconnected'|'auth_failure'|'error'
-const lastQr  = new Map();       // sessionId -> latest raw QR
-const say = (...a) => console.log('[wa]', ...a);
-
-// ---- create or return a session client ----
-function getOrCreate(sessionId) {
-  if (!sessionId) throw new Error('sessionId required');
-  if (clients.has(sessionId)) return clients.get(sessionId);
-
-  const client = new Client({
-    authStrategy: new LocalAuth({ clientId: sessionId, dataPath: DATA_PATH }),
-    puppeteer: { args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'] }
-  });
-
-  status.set(sessionId, 'starting');
-
-  client.on('qr', (qr) => {
-    status.set(sessionId, 'scanning');
-    lastQr.set(sessionId, qr);
-    pub(sessionId, { type: 'qr', ts: Date.now(), sessionId, qr });
-  });
-
-  client.on('ready', () => {
-    status.set(sessionId, 'ready');
-    lastQr.delete(sessionId);
-    say(`✅ [${sessionId}] ready`);
-    pub(sessionId, { type: 'ready', ts: Date.now(), sessionId });
-  });
-
-  // inbound + outbound (including messages you send from your phone)
-  client.on('message_create', (m) => {
-    pub(sessionId, {
-      type: 'message',
-      ts: Date.now(),
-      sessionId,
-      id: m.id?._serialized,
-      chatId: m.fromMe ? m.to : m.from,
-      fromMe: m.fromMe,
-      body: m.body,
-      messageType: m.type,
-      hasMedia: !!m.hasMedia,
-      waTimestamp: m.timestamp
-    });
-  });
-
-  client.on('message_ack', (m, ack) => {
-    pub(sessionId, {
-      type: 'message_ack',
-      ts: Date.now(),
-      sessionId,
-      id: m.id?._serialized,
-      chatId: m.fromMe ? m.to : m.from,
-      ack
-    });
-  });
-
-  client.on('disconnected', (reason) => {
-    status.set(sessionId, 'disconnected');
-    pub(sessionId, { type: 'disconnected', ts: Date.now(), sessionId, reason });
-  });
-
-  client.on('auth_failure', (err) => {
-    status.set(sessionId, 'auth_failure');
-    pub(sessionId, { type: 'auth_failure', ts: Date.now(), sessionId, err: String(err) });
-  });
-
-  client.on('error', (err) => {
-    status.set(sessionId, 'error');
-    pub(sessionId, { type: 'error', ts: Date.now(), sessionId, err: String(err?.message || err) });
-  });
-
-  clients.set(sessionId, client);
-  client.initialize();
-  return client;
-}
-
-// ---- HTTP API ----
-
-// 1) Create/init a session (scan QR if not linked yet)
-app.post('/init', (req, res) => {
-  try {
-    const sid = String(req.query.session || req.body?.sessionId || '').trim();
-    if (!sid) return res.status(400).json({ error: 'session required' });
-    getOrCreate(sid);
-    res.json({ ok: true, sessionId: sid, status: status.get(sid) || 'starting' });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
-  }
-});
-
-// 2) Show status / qr (per session)
-app.get('/status', (req, res) => {
-  const sid = String(req.query.session || '').trim();
-  if (!sid || !status.has(sid)) return res.status(404).json({ error: 'unknown session' });
-  res.json({ sessionId: sid, status: status.get(sid) });
-});
-app.get('/qr', (req, res) => {
-  const sid = String(req.query.session || '').trim();
-  if (!sid || !clients.has(sid)) return res.status(404).json({ error: 'unknown session' });
-  res.json({ sessionId: sid, qr: lastQr.get(sid) || null });
-});
-
-// 3) Send a text message
-//    body: { sessionId, chatId, body }
-app.post('/send', async (req, res) => {
-  try {
-    const sid   = String(req.body?.sessionId || '').trim();
-    const chat  = String(req.body?.chatId    || '').trim();
-    const text  = String(req.body?.body      ?? '');
-    if (!sid || !chat) return res.status(400).json({ error: 'sessionId & chatId required' });
-    const client = clients.get(sid) || getOrCreate(sid);
-    const msg = await client.sendMessage(chat, text);
-    pub(sid, { type: 'sent', ts: Date.now(), sessionId: sid, id: msg.id?._serialized, chatId: chat, body: text });
-    res.json({ id: msg.id?._serialized });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// Health
-app.get('/health', (_req, res) => res.json({ up: true, sessions: Array.from(status.entries()).map(([k,v])=>({sessionId:k,status:v})) }));
-
-// ---- start ----
-server.listen(PORT, () => console.log(`HTTP http://localhost:${PORT} | WS ws://localhost:${PORT}/ws`));
+// ---------- Start ----------
+server.listen(PORT, () =>
+  console.log(`HTTP http://0.0.0.0:${PORT} | WS ws://<host>:${PORT}/ws?accountId=<aid>&token=<FIREBASE_ID_TOKEN>`)
+);
