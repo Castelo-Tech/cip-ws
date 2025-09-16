@@ -32,6 +32,9 @@ app.use(express.json());
 app.use(cors({ origin: '*', methods: ['GET','POST','DELETE','OPTIONS'], allowedHeaders: ['Content-Type', 'Authorization'] }));
 app.options('*', (_req, res) => res.sendStatus(204));
 
+// --- async wrapper to prevent crashes from rejected promises ---
+const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
+
 // ---------- Utilities ----------
 const meta = createMetadata();
 const rbac = createRbac({ db });
@@ -53,7 +56,7 @@ async function requireUser(req, res, next) {
 }
 
 // ---------- REST: Server self-assign to account.wsServer ----------
-app.post('/admin/assignServer', requireUser, async (req, res) => {
+app.post('/admin/assignServer', requireUser, wrap(async (req, res) => {
   const { accountId, labels = {} } = req.body || {};
   if (!accountId) return res.status(400).json({ error: 'accountId required' });
 
@@ -78,10 +81,10 @@ app.post('/admin/assignServer', requireUser, async (req, res) => {
   }, { merge: true });
 
   res.json({ ok: true, accountId, wsServer: { ip, instance: name, zone, project, labels } });
-});
+}));
 
 // ---------- REST: Sessions (Admin) ----------
-app.get('/sessions', requireUser, async (req, res) => {
+app.get('/sessions', requireUser, wrap(async (req, res) => {
   const accountId = String(req.query.accountId || '');
   if (!accountId) return res.status(400).json({ error: 'accountId required' });
 
@@ -90,9 +93,9 @@ app.get('/sessions', requireUser, async (req, res) => {
   if (!role) return res.status(403).json({ error: 'not a member' });
 
   res.json(await registry.list(accountId));
-});
+}));
 
-app.post('/sessions/init', requireUser, async (req, res) => {
+app.post('/sessions/init', requireUser, wrap(async (req, res) => {
   const { accountId, label } = req.body || {};
   if (!accountId || !label) return res.status(400).json({ error: 'accountId, label required' });
 
@@ -101,9 +104,9 @@ app.post('/sessions/init', requireUser, async (req, res) => {
 
   sessions.init({ accountId, label });
   res.json({ ok: true, accountId, label, status: sessions.status({ accountId, label }) || 'starting' });
-});
+}));
 
-app.post('/sessions/stop', requireUser, async (req, res) => {
+app.post('/sessions/stop', requireUser, wrap(async (req, res) => {
   const { accountId, label } = req.body || {};
   if (!accountId || !label) return res.status(400).json({ error: 'accountId, label required' });
 
@@ -112,9 +115,9 @@ app.post('/sessions/stop', requireUser, async (req, res) => {
 
   await sessions.stop({ accountId, label });
   res.json({ ok: true, accountId, label, status: sessions.status({ accountId, label }) || 'stopped' });
-});
+}));
 
-app.post('/sessions/destroy', requireUser, async (req, res) => {
+app.post('/sessions/destroy', requireUser, wrap(async (req, res) => {
   const { accountId, label } = req.body || {};
   if (!accountId || !label) return res.status(400).json({ error: 'accountId, label required' });
 
@@ -123,9 +126,9 @@ app.post('/sessions/destroy', requireUser, async (req, res) => {
 
   await sessions.destroy({ accountId, label });
   res.json({ ok: true, accountId, label });
-});
+}));
 
-app.get('/status', requireUser, async (req, res) => {
+app.get('/status', requireUser, wrap(async (req, res) => {
   const accountId = String(req.query.accountId || '');
   const label     = String(req.query.label || req.query.session || '');
   if (!accountId || !label) return res.status(400).json({ error: 'accountId, label required' });
@@ -138,9 +141,9 @@ app.get('/status', requireUser, async (req, res) => {
     status: sessions.status({ accountId, label }),
     waId: await registry.getWaId(accountId, label)
   });
-});
+}));
 
-app.get('/qr', requireUser, async (req, res) => {
+app.get('/qr', requireUser, wrap(async (req, res) => {
   const accountId = String(req.query.accountId || '');
   const label     = String(req.query.label || req.query.session || '');
   if (!accountId || !label) return res.status(400).json({ error: 'accountId, label required' });
@@ -149,10 +152,10 @@ app.get('/qr', requireUser, async (req, res) => {
   if (!role) return res.status(403).json({ error: 'not a member' });
 
   res.json({ accountId, label, qr: sessions.qr({ accountId, label }) || null });
-});
+}));
 
 // ---------- REST: ACL (Admin manages per-account ACL docs) ----------
-app.get('/acl/users', requireUser, async (req, res) => {
+app.get('/acl/users', requireUser, wrap(async (req, res) => {
   const accountId = String(req.query.accountId || '');
   if (!accountId) return res.status(400).json({ error: 'accountId required' });
 
@@ -160,9 +163,9 @@ app.get('/acl/users', requireUser, async (req, res) => {
   if (role !== 'Administrator') return res.status(403).json({ error: 'not an Administrator' });
 
   res.json(await rbac.listAcl(accountId));
-});
+}));
 
-app.post('/acl/grant', requireUser, async (req, res) => {
+app.post('/acl/grant', requireUser, wrap(async (req, res) => {
   const { accountId, uid, sessions: allowed } = req.body || {};
   if (!accountId || !uid || !Array.isArray(allowed) || !allowed.length)
     return res.status(400).json({ error: 'accountId, uid, sessions[] required' });
@@ -172,9 +175,9 @@ app.post('/acl/grant', requireUser, async (req, res) => {
 
   await rbac.setAcl(accountId, uid, allowed);
   res.json({ ok: true });
-});
+}));
 
-app.post('/acl/revoke', requireUser, async (req, res) => {
+app.post('/acl/revoke', requireUser, wrap(async (req, res) => {
   const { accountId, uid } = req.body || {};
   if (!accountId || !uid) return res.status(400).json({ error: 'accountId, uid required' });
 
@@ -183,6 +186,15 @@ app.post('/acl/revoke', requireUser, async (req, res) => {
 
   await rbac.setAcl(accountId, uid, []);
   res.json({ ok: true });
+}));
+
+// ---------- error handling to avoid process crashes ----------
+app.use((err, req, res, _next) => {
+  console.error('Unhandled error:', err);
+  res.status(500).json({ error: 'internal_error', detail: String(err?.message || err) });
+});
+process.on('unhandledRejection', (err) => {
+  console.error('UNHANDLED REJECTION:', err);
 });
 
 // ---------- WS hub (auth via token + Firestore ACL; live ACL updates) ----------
