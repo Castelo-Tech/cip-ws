@@ -1,6 +1,5 @@
 // Main wiring: REST + WS, Firebase Admin auth, Firestore ACL/RBAC.
-// No messaging endpoints. Sessions are per-account and per-label.
-// Each WS connection binds to *one* accountId and is ACL-filtered.
+// Sessions are per-account and per-label. Each WS connection binds to one accountId and is ACL-filtered.
 
 // ---------- core ----------
 import express from 'express';
@@ -44,7 +43,7 @@ const rbac = createRbac({ db });
 const registry = createSessionRegistry({ db });
 const sessions = createSessionManager({ dataPath: './.wwebjs_auth', registry }); // WA LocalAuth + Firestore registry
 
-// 🔸 Boot-time restore (idempotent). Uses optional chaining so it won't break if the helper isn't present yet.
+// 🔸 Boot-time restore (idempotent).
 (async () => {
   try {
     const restored = (await sessions.restoreAllFromFs?.()) ?? null;
@@ -237,9 +236,6 @@ app.post('/acl/revoke', requireUser, async (req, res) => {
 });
 
 // ---------- NEW: Sessions live-truth & manual restore ----------
-
-// Returns what is actually running in memory. If the session manager
-// doesn’t expose listRunning(), we fall back to registry + per-row status().
 app.get('/sessions/running', requireUser, async (req, res) => {
   const accountId = String(req.query.accountId || '');
   if (!accountId) return res.status(400).json({ error: 'accountId required' });
@@ -247,12 +243,10 @@ app.get('/sessions/running', requireUser, async (req, res) => {
   const role = await rbac.getRole(accountId, req.user.uid);
   if (!role) return res.status(403).json({ error: 'not a member' });
 
-  // Preferred path (live truth from session manager)
   if (typeof sessions.listRunning === 'function') {
     return res.json(sessions.listRunning(accountId));
   }
 
-  // Fallback: registry + augment with live statuses if available
   const list = await registry.list(accountId);
   const augmented = await Promise.all(
     list.map(async (s) => {
@@ -262,16 +256,13 @@ app.get('/sessions/running', requireUser, async (req, res) => {
         label: s.label,
         status: status || s.status || null,
         waId: s.waId || null,
-        hasQr: false, // unknown without manager map; left as false in fallback
+        hasQr: false,
       };
     })
   );
   res.json(augmented);
 });
 
-// Manually scan .wwebjs_auth and bring sessions back.
-// If restoreAllFromFs() isn’t present yet, we simply tell the client that
-// restore is not available (no breakage).
 app.post('/sessions/restore', requireUser, async (req, res) => {
   const { accountId } = req.body || {};
   if (!accountId) return res.status(400).json({ error: 'accountId required' });
@@ -286,10 +277,7 @@ app.post('/sessions/restore', requireUser, async (req, res) => {
   res.json({ ok: true, restored: n });
 });
 
-// ---------- NEW: Messaging endpoints ----------
-
-// Text messages
-// Body: { accountId, label, to, text, options? }
+// ---------- Messaging ----------
 app.post('/messages/send', requireUser, async (req, res) => {
   const { accountId, label, to, text, options = {} } = req.body || {};
   if (!accountId || !label || !to || !text) {
@@ -310,8 +298,6 @@ app.post('/messages/send', requireUser, async (req, res) => {
   }
 });
 
-// Media messages (images/docs/audio/video/voice notes)
-// Body: { accountId, label, to, media: {mimetype, data(base64), filename?, filesize?} | {url} | {localPath}, options?: { caption?, sendAudioAsVoice?, sendMediaAsDocument?, linkPreview? } }
 app.post('/messages/sendMedia', requireUser, async (req, res) => {
   const { accountId, label, to, media, options = {} } = req.body || {};
   if (!accountId || !label || !to || !media) {
@@ -332,11 +318,7 @@ app.post('/messages/sendMedia', requireUser, async (req, res) => {
   }
 });
 
-// ---------- NEW: Media download-by-message endpoint ----------
-// GET /media/:messageId?accountId=...&label=...&disposition=inline|attachment
-// Auth via Firebase ID token (Authorization header). RBAC/ACL enforced.
-// Returns binary response with correct Content-Type & filename. Client can fetch()
-// and createObjectURL to display/play.
+// ---------- Media download ----------
 app.get('/media/:messageId', requireUser, async (req, res) => {
   const accountId = String(req.query.accountId || '');
   const label = String(req.query.label || '');
@@ -357,20 +339,67 @@ app.get('/media/:messageId', requireUser, async (req, res) => {
     res.setHeader('Content-Type', media.mimetype || 'application/octet-stream');
     res.setHeader('Content-Length', Buffer.byteLength(media.dataB64 || '', 'base64'));
     res.setHeader('Content-Disposition', `${disposition}; filename="${filename.replace(/"/g, '')}"`);
-    // Stream base64 → binary
     res.end(Buffer.from(media.dataB64, 'base64'));
   } catch (e) {
     res.status(500).json({ error: 'download failed', detail: String(e?.message || e) });
   }
 });
 
-// ---------- WS hub (auth via token + Firestore ACL; live ACL updates) ----------
+// ---------- NEW: Contacts APIs ----------
+
+// GET /contacts?accountId=...&label=...&details=true|false
+app.get('/contacts', requireUser, async (req, res) => {
+  const accountId = String(req.query.accountId || '');
+  const label = String(req.query.label || '');
+  const withDetails = String(req.query.details || 'false') === 'true';
+
+  if (!accountId || !label) return res.status(400).json({ error: 'accountId, label required' });
+
+  const allowed = await ensureAllowed(req, res, accountId, label);
+  if (!allowed) return;
+
+  const st = sessions.status({ accountId, label });
+  if (st !== 'ready') return res.status(409).json({ error: 'session not ready', status: st || null });
+
+  try {
+    const list = await sessions.getContacts({ accountId, label, withDetails });
+    res.json({ ok: true, count: list.length, contacts: list });
+  } catch (e) {
+    res.status(500).json({ error: 'contacts_failed', detail: String(e?.message || e) });
+  }
+});
+
+// POST /contacts/lookup
+// Body: { accountId, label, numbers: string[], countryCode?: string, withDetails?: boolean }
+app.post('/contacts/lookup', requireUser, async (req, res) => {
+  const { accountId, label, numbers, countryCode, withDetails = true } = req.body || {};
+  if (!accountId || !label || !Array.isArray(numbers) || numbers.length === 0) {
+    return res.status(400).json({ error: 'accountId, label, numbers[] required' });
+  }
+
+  const allowed = await ensureAllowed(req, res, accountId, label);
+  if (!allowed) return;
+
+  const st = sessions.status({ accountId, label });
+  if (st !== 'ready') return res.status(409).json({ error: 'session not ready', status: st || null });
+
+  try {
+    const out = await sessions.lookupContactsByNumbers({
+      accountId, label, numbers, countryCode: countryCode || null, withDetails: !!withDetails
+    });
+    res.json({ ok: true, results: out });
+  } catch (e) {
+    res.status(500).json({ error: 'lookup_failed', detail: String(e?.message || e) });
+  }
+});
+
+// ---------- WS hub ----------
 const server = http.createServer(app);
 createWsHub({
   server,
   authAdmin,
   rbac,
-  sessions, // for event stream
+  sessions,
   maxConnections: 2000,
 });
 
