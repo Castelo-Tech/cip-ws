@@ -1,3 +1,4 @@
+// server.js
 // Main wiring: REST + WS, Firebase Admin auth, Firestore ACL/RBAC.
 // Sessions are per-account and per-label. Each WS connection binds to one accountId and is ACL-filtered.
 
@@ -345,9 +346,7 @@ app.get('/media/:messageId', requireUser, async (req, res) => {
   }
 });
 
-// ---------- NEW: Contacts APIs ----------
-
-// GET /contacts?accountId=...&label=...&details=true|false
+// ---------- Contacts ----------
 app.get('/contacts', requireUser, async (req, res) => {
   const accountId = String(req.query.accountId || '');
   const label = String(req.query.label || '');
@@ -369,8 +368,6 @@ app.get('/contacts', requireUser, async (req, res) => {
   }
 });
 
-// POST /contacts/lookup
-// Body: { accountId, label, numbers: string[], countryCode?: string, withDetails?: boolean }
 app.post('/contacts/lookup', requireUser, async (req, res) => {
   const { accountId, label, numbers, countryCode, withDetails = true } = req.body || {};
   if (!accountId || !label || !Array.isArray(numbers) || numbers.length === 0) {
@@ -390,6 +387,81 @@ app.post('/contacts/lookup', requireUser, async (req, res) => {
     res.json({ ok: true, results: out });
   } catch (e) {
     res.status(500).json({ error: 'lookup_failed', detail: String(e?.message || e) });
+  }
+});
+
+// NEW: single-number check (on-demand details only when asked)
+// GET /contacts/check?accountId=...&label=...&number=...&countryCode=...&details=true|false
+app.get('/contacts/check', requireUser, async (req, res) => {
+  const accountId = String(req.query.accountId || '');
+  const label = String(req.query.label || '');
+  const number = String(req.query.number || '');
+  const countryCode = req.query.countryCode ? String(req.query.countryCode) : null;
+  const withDetails = String(req.query.details || 'false') === 'true';
+
+  if (!accountId || !label || !number) {
+    return res.status(400).json({ error: 'accountId, label, number required' });
+  }
+  const allowed = await ensureAllowed(req, res, accountId, label);
+  if (!allowed) return;
+
+  const st = sessions.status({ accountId, label });
+  if (st !== 'ready') return res.status(409).json({ error: 'session not ready', status: st || null });
+
+  try {
+    const out = await sessions.checkContactByNumber({ accountId, label, number, countryCode, withDetails });
+    res.json({ ok: true, ...out });
+  } catch (e) {
+    res.status(500).json({ error: 'check_failed', detail: String(e?.message || e) });
+  }
+});
+
+// ---------- NEW: Chats ----------
+/**
+ * GET /chats?accountId=...&label=...
+ * Returns a lightweight list of chats (no messages).
+ */
+app.get('/chats', requireUser, async (req, res) => {
+  const accountId = String(req.query.accountId || '');
+  const label = String(req.query.label || '');
+  if (!accountId || !label) return res.status(400).json({ error: 'accountId, label required' });
+
+  const allowed = await ensureAllowed(req, res, accountId, label);
+  if (!allowed) return;
+
+  const st = sessions.status({ accountId, label });
+  if (st !== 'ready') return res.status(409).json({ error: 'session not ready', status: st || null });
+
+  try {
+    const chats = await sessions.getChats({ accountId, label });
+    res.json({ ok: true, count: chats.length, chats });
+  } catch (e) {
+    res.status(500).json({ error: 'chats_failed', detail: String(e?.message || e) });
+  }
+});
+
+/**
+ * GET /chats/byNumber?accountId=...&label=...&number=...&countryCode=...
+ * Looks up WA ID for number; returns chat metadata if it exists.
+ */
+app.get('/chats/byNumber', requireUser, async (req, res) => {
+  const accountId = String(req.query.accountId || '');
+  const label = String(req.query.label || '');
+  const number = String(req.query.number || '');
+  const countryCode = req.query.countryCode ? String(req.query.countryCode) : null;
+  if (!accountId || !label || !number) return res.status(400).json({ error: 'accountId, label, number required' });
+
+  const allowed = await ensureAllowed(req, res, accountId, label);
+  if (!allowed) return;
+
+  const st = sessions.status({ accountId, label });
+  if (st !== 'ready') return res.status(409).json({ error: 'session not ready', status: st || null });
+
+  try {
+    const result = await sessions.getChatByNumber({ accountId, label, number, countryCode });
+    res.json({ ok: true, ...result });
+  } catch (e) {
+    res.status(500).json({ error: 'chat_lookup_failed', detail: String(e?.message || e) });
   }
 });
 
