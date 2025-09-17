@@ -27,6 +27,8 @@ if ! command -v node >/dev/null 2>&1; then
   apt-get install -y nodejs
 fi
 
+echo "==> Node: $(node -v 2>/dev/null || echo 'not found'), npm: $(npm -v 2>/dev/null || echo 'not found')"
+
 echo "==> Installing npm dependencies in $REPO_DIR …"
 if [ -f "$REPO_DIR/package-lock.json" ]; then
   npm --prefix "$REPO_DIR" ci
@@ -34,8 +36,19 @@ else
   npm --prefix "$REPO_DIR" install
 fi
 
-echo "==> Creating systemd service to run: npm start"
-SERVICE_PATH="/etc/systemd/system/whatsapp-server.service"
+# Ensure runtime data dirs exist and are owned by the service user (root here)
+mkdir -p "$REPO_DIR/.wwebjs_auth" "$REPO_DIR/.wwebjs_cache"
+chown -R root:root "$REPO_DIR/.wwebjs_auth" "$REPO_DIR/.wwebjs_cache"
+
+echo "==> Creating/Updating systemd service to run: npm start"
+SERVICE_NAME="whatsapp-server"
+SERVICE_PATH="/etc/systemd/system/${SERVICE_NAME}.service"
+
+# Backup existing unit if present
+if [ -f "$SERVICE_PATH" ]; then
+  cp -f "$SERVICE_PATH" "${SERVICE_PATH}.bak.$(date +%Y%m%d%H%M%S)"
+fi
+
 cat >"$SERVICE_PATH" <<EOF
 [Unit]
 Description=WhatsApp Server (npm start)
@@ -46,18 +59,29 @@ Wants=network-online.target
 Type=simple
 User=root
 WorkingDirectory=${REPO_DIR}
+# Keep your current entrypoint
 ExecStart=/usr/bin/npm run start --silent
+# Make sure data dirs exist before starting
+ExecStartPre=/usr/bin/mkdir -p ${REPO_DIR}/.wwebjs_auth ${REPO_DIR}/.wwebjs_cache
+ExecStartPre=/usr/bin/chown -R root:root ${REPO_DIR}/.wwebjs_auth ${REPO_DIR}/.wwebjs_cache
+# Graceful shutdown + resiliency
+KillSignal=SIGINT
+TimeoutStopSec=20
 Restart=always
 RestartSec=3
+# Useful env
+Environment=NODE_ENV=production
 Environment=PUPPETEER_SKIP_DOWNLOAD=false
+# Give Puppeteer/WS more file descriptors
+LimitNOFILE=65535
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
 systemctl daemon-reload
-systemctl enable --now whatsapp-server
+systemctl enable --now "${SERVICE_NAME}"
 
 echo "==> Done."
-systemctl status whatsapp-server --no-pager || true
-echo "Logs: journalctl -u whatsapp-server -f"
+systemctl status "${SERVICE_NAME}" --no-pager || true
+echo "Logs: journalctl -u ${SERVICE_NAME} -f"

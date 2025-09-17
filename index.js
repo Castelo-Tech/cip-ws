@@ -29,7 +29,13 @@ const authAdmin = getAuth();
 // ---------- Express ----------
 const app = express();
 app.use(express.json());
-app.use(cors({ origin: '*', methods: ['GET','POST','DELETE','OPTIONS'], allowedHeaders: ['Content-Type', 'Authorization'] }));
+app.use(
+  cors({
+    origin: '*',
+    methods: ['GET', 'POST', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization'],
+  })
+);
 app.options('*', (_req, res) => res.sendStatus(204));
 
 // ---------- Utilities ----------
@@ -37,6 +43,20 @@ const meta = createMetadata();
 const rbac = createRbac({ db });
 const registry = createSessionRegistry({ db });
 const sessions = createSessionManager({ dataPath: './.wwebjs_auth', registry }); // WA LocalAuth + Firestore registry
+
+// 🔸 Boot-time restore (idempotent). Uses optional chaining so it won't break if the helper isn't present yet.
+(async () => {
+  try {
+    const restored = (await sessions.restoreAllFromFs?.()) ?? null;
+    if (restored !== null) {
+      console.log(`[boot] restored ${restored} WA session(s) from disk`);
+    } else {
+      console.log('[boot] restoreAllFromFs() not available; skip disk restore');
+    }
+  } catch (e) {
+    console.error('[boot] restoreAllFromFs failed', e);
+  }
+})();
 
 // Helper: bearer token → Firebase user (uid)
 async function requireUser(req, res, next) {
@@ -51,6 +71,11 @@ async function requireUser(req, res, next) {
     return res.status(401).json({ error: 'invalid token' });
   }
 }
+
+// ---------- REST: Health ----------
+app.get('/healthz', (_req, res) => {
+  res.json({ ok: true, ts: Date.now() });
+});
 
 // ---------- REST: Server self-assign to account.wsServer ----------
 app.post('/admin/assignServer', requireUser, async (req, res) => {
@@ -69,13 +94,19 @@ app.post('/admin/assignServer', requireUser, async (req, res) => {
     meta.projectId()
   ]);
 
-  await db.collection('accounts').doc(accountId).set({
-    wsServer: {
-      assignedAt: new Date(),
-      ip, instance: name, zone, project,
-      labels: Object(labels)
-    }
-  }, { merge: true });
+  await db.collection('accounts').doc(accountId).set(
+    {
+      wsServer: {
+        assignedAt: new Date(),
+        ip,
+        instance: name,
+        zone,
+        project,
+        labels: Object(labels),
+      },
+    },
+    { merge: true }
+  );
 
   res.json({ ok: true, accountId, wsServer: { ip, instance: name, zone, project, labels } });
 });
@@ -127,22 +158,23 @@ app.post('/sessions/destroy', requireUser, async (req, res) => {
 
 app.get('/status', requireUser, async (req, res) => {
   const accountId = String(req.query.accountId || '');
-  const label     = String(req.query.label || req.query.session || '');
+  const label = String(req.query.label || req.query.session || '');
   if (!accountId || !label) return res.status(400).json({ error: 'accountId, label required' });
 
   const role = await rbac.getRole(accountId, req.user.uid);
   if (!role) return res.status(403).json({ error: 'not a member' });
 
   res.json({
-    accountId, label,
+    accountId,
+    label,
     status: sessions.status({ accountId, label }),
-    waId: await registry.getWaId(accountId, label)
+    waId: await registry.getWaId(accountId, label),
   });
 });
 
 app.get('/qr', requireUser, async (req, res) => {
   const accountId = String(req.query.accountId || '');
-  const label     = String(req.query.label || req.query.session || '');
+  const label = String(req.query.label || req.query.session || '');
   if (!accountId || !label) return res.status(400).json({ error: 'accountId, label required' });
 
   const role = await rbac.getRole(accountId, req.user.uid);
@@ -185,17 +217,69 @@ app.post('/acl/revoke', requireUser, async (req, res) => {
   res.json({ ok: true });
 });
 
+// ---------- NEW: Sessions live-truth & manual restore ----------
+
+// Returns what is actually running in memory. If the session manager
+// doesn’t expose listRunning(), we fall back to registry + per-row status().
+app.get('/sessions/running', requireUser, async (req, res) => {
+  const accountId = String(req.query.accountId || '');
+  if (!accountId) return res.status(400).json({ error: 'accountId required' });
+
+  const role = await rbac.getRole(accountId, req.user.uid);
+  if (!role) return res.status(403).json({ error: 'not a member' });
+
+  // Preferred path (live truth from session manager)
+  if (typeof sessions.listRunning === 'function') {
+    return res.json(sessions.listRunning(accountId));
+  }
+
+  // Fallback: registry + augment with live statuses if available
+  const list = await registry.list(accountId);
+  const augmented = await Promise.all(
+    list.map(async (s) => {
+      const status = sessions.status ? sessions.status({ accountId: s.accountId, label: s.label }) : s.status;
+      return {
+        accountId: s.accountId,
+        label: s.label,
+        status: status || s.status || null,
+        waId: s.waId || null,
+        hasQr: false, // unknown without manager map; left as false in fallback
+      };
+    })
+  );
+  res.json(augmented);
+});
+
+// Manually scan .wwebjs_auth and bring sessions back.
+// If restoreAllFromFs() isn’t present yet, we simply tell the client that
+// restore is not available (no breakage).
+app.post('/sessions/restore', requireUser, async (req, res) => {
+  const { accountId } = req.body || {};
+  if (!accountId) return res.status(400).json({ error: 'accountId required' });
+
+  const role = await rbac.getRole(accountId, req.user.uid);
+  if (role !== 'Administrator') return res.status(403).json({ error: 'not an Administrator' });
+
+  if (typeof sessions.restoreAllFromFs !== 'function') {
+    return res.json({ ok: true, restored: null, note: 'restoreAllFromFs() not available in session manager' });
+  }
+  const n = await sessions.restoreAllFromFs();
+  res.json({ ok: true, restored: n });
+});
+
 // ---------- WS hub (auth via token + Firestore ACL; live ACL updates) ----------
 const server = http.createServer(app);
 createWsHub({
   server,
   authAdmin,
   rbac,
-  sessions,     // for event stream
-  maxConnections: 2000
+  sessions, // for event stream
+  maxConnections: 2000,
 });
 
 // ---------- Start ----------
 server.listen(PORT, () =>
-  console.log(`HTTP http://0.0.0.0:${PORT} | WS ws://<host>:${PORT}/ws?accountId=<aid>&token=<FIREBASE_ID_TOKEN>`)
+  console.log(
+    `HTTP http://0.0.0.0:${PORT} | WS ws://<host>:${PORT}/ws?accountId=<aid>&token=<FIREBASE_ID_TOKEN>`
+  )
 );
