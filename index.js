@@ -28,7 +28,7 @@ const authAdmin = getAuth();
 
 // ---------- Express ----------
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: '25mb' })); // allow base64 media payloads
 app.use(
   cors({
     origin: '*',
@@ -70,6 +70,25 @@ async function requireUser(req, res, next) {
   } catch (e) {
     return res.status(401).json({ error: 'invalid token' });
   }
+}
+
+// Small helper: is user allowed to act on this session?
+async function ensureAllowed(req, res, accountId, label, { requireAdmin = false } = {}) {
+  const allowed = await rbac.allowedSessions(accountId, req.user.uid);
+  if (!allowed.role) {
+    res.status(403).json({ error: 'not a member' });
+    return null;
+  }
+  if (requireAdmin && allowed.role !== 'Administrator') {
+    res.status(403).json({ error: 'not an Administrator' });
+    return null;
+  }
+  if (allowed.role === 'Administrator') return allowed;
+  if (!allowed.sessions.includes(label)) {
+    res.status(403).json({ error: 'session not allowed by ACL' });
+    return null;
+  }
+  return allowed;
 }
 
 // ---------- REST: Health ----------
@@ -127,8 +146,8 @@ app.post('/sessions/init', requireUser, async (req, res) => {
   const { accountId, label } = req.body || {};
   if (!accountId || !label) return res.status(400).json({ error: 'accountId, label required' });
 
-  const role = await rbac.getRole(accountId, req.user.uid);
-  if (role !== 'Administrator') return res.status(403).json({ error: 'not an Administrator' });
+  const allowed = await ensureAllowed(req, res, accountId, label, { requireAdmin: true });
+  if (!allowed) return;
 
   sessions.init({ accountId, label });
   res.json({ ok: true, accountId, label, status: sessions.status({ accountId, label }) || 'starting' });
@@ -138,8 +157,8 @@ app.post('/sessions/stop', requireUser, async (req, res) => {
   const { accountId, label } = req.body || {};
   if (!accountId || !label) return res.status(400).json({ error: 'accountId, label required' });
 
-  const role = await rbac.getRole(accountId, req.user.uid);
-  if (role !== 'Administrator') return res.status(403).json({ error: 'not an Administrator' });
+  const allowed = await ensureAllowed(req, res, accountId, label, { requireAdmin: true });
+  if (!allowed) return;
 
   await sessions.stop({ accountId, label });
   res.json({ ok: true, accountId, label, status: sessions.status({ accountId, label }) || 'stopped' });
@@ -149,8 +168,8 @@ app.post('/sessions/destroy', requireUser, async (req, res) => {
   const { accountId, label } = req.body || {};
   if (!accountId || !label) return res.status(400).json({ error: 'accountId, label required' });
 
-  const role = await rbac.getRole(accountId, req.user.uid);
-  if (role !== 'Administrator') return res.status(403).json({ error: 'not an Administrator' });
+  const allowed = await ensureAllowed(req, res, accountId, label, { requireAdmin: true });
+  if (!allowed) return;
 
   await sessions.destroy({ accountId, label });
   res.json({ ok: true, accountId, label });
@@ -257,14 +276,92 @@ app.post('/sessions/restore', requireUser, async (req, res) => {
   const { accountId } = req.body || {};
   if (!accountId) return res.status(400).json({ error: 'accountId required' });
 
-  const role = await rbac.getRole(accountId, req.user.uid);
-  if (role !== 'Administrator') return res.status(403).json({ error: 'not an Administrator' });
+  const allowed = await ensureAllowed(req, res, accountId, 'any', { requireAdmin: true });
+  if (!allowed) return;
 
   if (typeof sessions.restoreAllFromFs !== 'function') {
     return res.json({ ok: true, restored: null, note: 'restoreAllFromFs() not available in session manager' });
   }
   const n = await sessions.restoreAllFromFs();
   res.json({ ok: true, restored: n });
+});
+
+// ---------- NEW: Messaging endpoints ----------
+
+// Text messages
+// Body: { accountId, label, to, text, options? }
+app.post('/messages/send', requireUser, async (req, res) => {
+  const { accountId, label, to, text, options = {} } = req.body || {};
+  if (!accountId || !label || !to || !text) {
+    return res.status(400).json({ error: 'accountId, label, to, text required' });
+  }
+
+  const allowed = await ensureAllowed(req, res, accountId, label);
+  if (!allowed) return;
+
+  const st = sessions.status({ accountId, label });
+  if (st !== 'ready') return res.status(409).json({ error: 'session not ready', status: st || null });
+
+  try {
+    const msg = await sessions.sendText({ accountId, label, to, text, options });
+    res.json({ ok: true, id: msg?.id?._serialized || null, timestamp: msg?.timestamp || Date.now() });
+  } catch (e) {
+    res.status(500).json({ error: 'send failed', detail: String(e?.message || e) });
+  }
+});
+
+// Media messages (images/docs/audio/video/voice notes)
+// Body: { accountId, label, to, media: {mimetype, data(base64), filename?, filesize?} | {url} | {localPath}, options?: { caption?, sendAudioAsVoice?, sendMediaAsDocument?, linkPreview? } }
+app.post('/messages/sendMedia', requireUser, async (req, res) => {
+  const { accountId, label, to, media, options = {} } = req.body || {};
+  if (!accountId || !label || !to || !media) {
+    return res.status(400).json({ error: 'accountId, label, to, media required' });
+  }
+
+  const allowed = await ensureAllowed(req, res, accountId, label);
+  if (!allowed) return;
+
+  const st = sessions.status({ accountId, label });
+  if (st !== 'ready') return res.status(409).json({ error: 'session not ready', status: st || null });
+
+  try {
+    const msg = await sessions.sendMedia({ accountId, label, to, media, options });
+    res.json({ ok: true, id: msg?.id?._serialized || null, timestamp: msg?.timestamp || Date.now() });
+  } catch (e) {
+    res.status(500).json({ error: 'send failed', detail: String(e?.message || e) });
+  }
+});
+
+// ---------- NEW: Media download-by-message endpoint ----------
+// GET /media/:messageId?accountId=...&label=...&disposition=inline|attachment
+// Auth via Firebase ID token (Authorization header). RBAC/ACL enforced.
+// Returns binary response with correct Content-Type & filename. Client can fetch()
+// and createObjectURL to display/play.
+app.get('/media/:messageId', requireUser, async (req, res) => {
+  const accountId = String(req.query.accountId || '');
+  const label = String(req.query.label || '');
+  const messageId = String(req.params.messageId || '');
+  const disposition = String(req.query.disposition || 'inline');
+
+  if (!accountId || !label || !messageId) {
+    return res.status(400).json({ error: 'accountId, label, messageId required' });
+  }
+  const allowed = await ensureAllowed(req, res, accountId, label);
+  if (!allowed) return;
+
+  try {
+    const media = await sessions.downloadMessageMedia({ accountId, label, messageId });
+    if (!media) return res.status(404).json({ error: 'media not available' });
+
+    const filename = media.filename || `wa-${messageId}`;
+    res.setHeader('Content-Type', media.mimetype || 'application/octet-stream');
+    res.setHeader('Content-Length', Buffer.byteLength(media.dataB64 || '', 'base64'));
+    res.setHeader('Content-Disposition', `${disposition}; filename="${filename.replace(/"/g, '')}"`);
+    // Stream base64 → binary
+    res.end(Buffer.from(media.dataB64, 'base64'));
+  } catch (e) {
+    res.status(500).json({ error: 'download failed', detail: String(e?.message || e) });
+  }
 });
 
 // ---------- WS hub (auth via token + Firestore ACL; live ACL updates) ----------
