@@ -12,6 +12,9 @@ import { initializeApp, applicationDefault } from 'firebase-admin/app';
 import { getAuth } from 'firebase-admin/auth';
 import { getFirestore } from 'firebase-admin/firestore';
 
+// ---------- gcs (for Firebase Storage bucket) ----------
+import { Storage } from '@google-cloud/storage';
+
 // ---------- local modules (untouched) ----------
 import { createMetadata } from './lib/metadata.js';
 import { createRbac } from './lib/rbac.js';
@@ -19,7 +22,7 @@ import { createSessionManager } from './lib/sessionManager.js';
 import { createWsHub } from './lib/wsHub.js';
 import { createSessionRegistry } from './lib/sessionRegistry.js';
 
-// ---------- route modules (new) ----------
+// ---------- route modules (existing) ----------
 import { buildHealthRouter } from './routes/health.js';
 import { buildAdminRouter } from './routes/admin.js';
 import { buildSessionsRouter } from './routes/sessions.js';
@@ -35,6 +38,15 @@ const PORT = 3001;
 initializeApp({ credential: applicationDefault() });
 const db = getFirestore();
 const authAdmin = getAuth();
+
+// ---------- Google Cloud Storage (ADC) ----------
+/**
+ * NOTE: The bucket name *looks* like a domain, but it's the canonical bucket name.
+ * We use the GCS client directly (works fine for Firebase Storage buckets).
+ */
+const BUCKET_NAME = 'castelo-insure-platform.firebasestorage.app';
+const storage = new Storage(); // uses ADC on your VM
+const bucket = storage.bucket(BUCKET_NAME);
 
 // ---------- Express ----------
 const app = express();
@@ -108,7 +120,10 @@ app.use(buildSessionsRouter({ rbac, registry, sessions, requireUser, ensureAllow
 app.use(buildAclRouter({ rbac, requireUser }));
 app.use(buildMessagesRouter({ sessions, requireUser, ensureAllowed }));
 app.use(buildMediaRouter({ sessions, requireUser, ensureAllowed }));
-app.use(buildContactsRouter({ sessions, requireUser, ensureAllowed }));
+
+// ⬇️ pass the bucket into contacts router
+app.use(buildContactsRouter({ sessions, requireUser, ensureAllowed, bucket }));
+
 app.use(buildChatsRouter({ sessions, requireUser, ensureAllowed }));
 
 // ---------- WS hub ----------
