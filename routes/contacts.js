@@ -1,5 +1,6 @@
 // routes/contacts.js
 import { Router } from 'express';
+import { sleep, rand, normalizeChatId } from '../lib/session/utils.js';
 
 // ===== GCS helpers =====
 async function ensurePrefix(bucket, prefix) {
