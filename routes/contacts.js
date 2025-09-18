@@ -119,6 +119,78 @@ function stageSet(job, key, patch) {
   job.lastUpdatedAt = Date.now();
 }
 
+// ===== Small shared helpers to avoid duplication =====
+function filterStrictCUs(contacts) {
+  return contacts.filter(
+    (c) =>
+      c?.type === 'private' &&
+      !!c?.isMyContact &&
+      !!c?.isWAContact &&
+      typeof c?.id === 'string' &&
+      waIdIsCUs(c.id)
+  );
+}
+function digitsForList(list) {
+  return list.map((c) => numberFromContact(c)).filter(Boolean);
+}
+async function snapshotExistingByDigits(db, contactsCol, digitsList) {
+  const docRefs = digitsList.map((d) => contactsCol.doc(docIdForDigits(d)));
+  const existingSnaps = docRefs.length ? await batchedGetAll(db, docRefs, 300) : [];
+  const existingByDigits = new Map();
+  for (let i = 0; i < existingSnaps.length; i++) {
+    const d = digitsList[i];
+    const snap = existingSnaps[i];
+    if (d && snap?.exists) existingByDigits.set(d, snap.data());
+  }
+  return existingByDigits;
+}
+function upsertContactsOps(subset, digitsList, existingByDigits, contactsCol) {
+  const ops = [];
+  let appended = 0, updated = 0;
+  const appendedDigits = new Set();
+
+  for (let i = 0; i < subset.length; i++) {
+    const c = subset[i];
+    const digits = digitsList[i];
+    if (!digits) continue;
+
+    const ref = contactsCol.doc(docIdForDigits(digits));
+    const incoming = {
+      id: c.id,
+      number: digits,
+      name: c?.name || null,
+      pushname: c?.pushname || null,
+      shortName: c?.shortName || null,
+      isWAContact: !!c?.isWAContact,
+      isMyContact: !!c?.isMyContact,
+      isBusiness: !!c?.isBusiness,
+      isEnterprise: !!c?.isEnterprise,
+      hasChat: !!c?.hasChat,
+      registered: true, // for real WA contacts from device
+      type: 'private',
+      updatedAt: FieldValue.serverTimestamp(),
+    };
+
+    const existing = existingByDigits.get(digits);
+    if (!existing) {
+      ops.push({ ref, set: { ...incoming, createdAt: FieldValue.serverTimestamp() } });
+      appended++;
+      appendedDigits.add(digits);
+    } else {
+      const baseDiff = diffFillOnly(existing, incoming);
+      for (const f of ALWAYS_UPDATE_FLAGS) {
+        if (incoming[f] !== undefined && incoming[f] !== existing[f]) baseDiff[f] = incoming[f];
+      }
+      if (Object.keys(baseDiff).length) {
+        ops.push({ ref, update: { ...baseDiff, updatedAt: FieldValue.serverTimestamp() } });
+        updated++;
+      }
+    }
+  }
+
+  return { ops, appended, updated, appendedDigits };
+}
+
 // ===== Router =====
 export function buildContactsRouter({ db, sessions, requireUser, ensureAllowed }) {
   const r = Router();
@@ -147,123 +219,58 @@ export function buildContactsRouter({ db, sessions, requireUser, ensureAllowed }
     try {
       // ---- Phase 1: CONTACTS (no details) ----
       const all = await sessions.getContacts({ accountId, label, withDetails: false });
-
-      // STRICT filter: private + isMyContact + isWAContact + @c.us
-      const subset = all.filter(
-        (c) =>
-          c?.type === 'private' &&
-          !!c?.isMyContact &&
-          !!c?.isWAContact &&
-          typeof c?.id === 'string' &&
-          waIdIsCUs(c.id)
-      );
+      const subset = filterStrictCUs(all);
+      const digitsList = digitsForList(subset);
 
       const { contacts: contactsCol } = sessRefs(db, accountId, label);
-      const digitsList = subset.map((c) => numberFromContact(c)).filter(Boolean);
+      const existingByDigits = await snapshotExistingByDigits(db, contactsCol, digitsList);
 
-      const docRefs = digitsList.map((d) => contactsCol.doc(docIdForDigits(d)));
-      const existingSnaps = docRefs.length ? await batchedGetAll(db, docRefs, 300) : [];
-      const existingByDigits = new Map();
-      for (let i = 0; i < existingSnaps.length; i++) {
-        const d = digitsList[i];
-        const snap = existingSnaps[i];
-        if (d && snap?.exists) existingByDigits.set(d, snap.data());
-      }
+      const { ops, appended, updated, appendedDigits } =
+        upsertContactsOps(subset, digitsList, existingByDigits, contactsCol);
 
-      const ops = [];
-      let appended = 0, updated = 0;
-      for (let i = 0; i < subset.length; i++) {
-        const c = subset[i];
-        const digits = digitsList[i];
-        if (!digits) continue;
-
-        const ref = contactsCol.doc(docIdForDigits(digits));
-        const incoming = {
-          id: c.id,
-          number: digits,
-          name: c?.name || null,
-          pushname: c?.pushname || null,
-          shortName: c?.shortName || null,
-          isWAContact: !!c?.isWAContact,
-          isMyContact: !!c?.isMyContact,
-          isBusiness: !!c?.isBusiness,
-          isEnterprise: !!c?.isEnterprise,
-          hasChat: !!c?.hasChat,
-          registered: true, // for real WA contacts from device
-          type: 'private',
-          updatedAt: FieldValue.serverTimestamp(),
-        };
-
-        const existing = existingByDigits.get(digits);
-        if (!existing) {
-          ops.push({ ref, set: { ...incoming, createdAt: FieldValue.serverTimestamp() } });
-          appended++;
-        } else {
-          // fill-only for most fields, but ALWAYS update core flags if changed
-          const baseDiff = diffFillOnly(existing, incoming);
-          for (const f of ALWAYS_UPDATE_FLAGS) {
-            if (incoming[f] !== undefined && incoming[f] !== existing[f]) baseDiff[f] = incoming[f];
-          }
-          if (Object.keys(baseDiff).length) {
-            ops.push({ ref, update: { ...baseDiff, updatedAt: FieldValue.serverTimestamp() } });
-            updated++;
-          }
-        }
-      }
       if (ops.length) await batchedSetOrUpdate(db, ops);
       phases.contacts = { ok: true, appended, updated };
 
       // ---- Phase 2: ENRICH (pics/about) ----
       let enrichUpdated = 0;
-      if (wantDetailsAtEnd) {
-        try {
-          const refSnaps = docRefs.length ? await batchedGetAll(db, docRefs, 300) : [];
-          const existingMap = new Map();
-          for (let i = 0; i < refSnaps.length; i++) {
-            const d = digitsList[i];
-            const snap = refSnaps[i];
-            if (d && snap?.exists) existingMap.set(d, snap.data());
-          }
+      if (wantDetailsAtEnd && subset.length) {
+        // Enrich if the doc didn't exist before OR both fields are still missing.
+        const needEnrich = subset.filter((c, i) => {
+          const d = digitsList[i];
+          const ex = existingByDigits.get(d);
+          return appendedDigits.has(d) || (ex && !ex.profilePicUrl && !ex.about);
+        });
 
-          const needEnrich = subset.filter((c, i) => {
-            const d = digitsList[i];
-            const ex = existingMap.get(d);
-            return ex && (!ex.profilePicUrl && !ex.about);
-          });
+        if (needEnrich.length) {
+          const enrichedList = await sessions.enrichContactsSequential({ accountId, label, contacts: needEnrich });
+          const eops = [];
+          for (const c of enrichedList) {
+            const digits = numberFromContact(c);
+            if (!digits || !waIdIsCUs(c?.id)) continue;
 
-          if (needEnrich.length) {
-            const enrichedList = await sessions.enrichContactsSequential({ accountId, label, contacts: needEnrich });
-            const eops = [];
-            for (const c of enrichedList) {
-              const digits = numberFromContact(c);
-              if (!digits || !waIdIsCUs(c?.id)) continue;
-
-              const existing = existingMap.get(digits) || {};
-              const incoming = {
-                profilePicUrl: c?.profilePicUrl ?? null,
-                about: typeof c?.about === 'string' && c.about.length ? c.about : null,
-              };
-              const diff = diffFillOnly(existing, incoming);
-              if (Object.keys(diff).length) {
-                const changed = changedFields(existing, diff);
-                eops.push({
-                  ref: sessRefs(db, accountId, label).contacts.doc(docIdForDigits(digits)),
-                  update: {
-                    ...diff,
-                    enrichedAt: FieldValue.serverTimestamp(),
-                    ...(changed.length ? { enrichedFields: FieldValue.arrayUnion(...changed) } : {}),
-                    updatedAt: FieldValue.serverTimestamp(),
-                  },
-                });
-                enrichUpdated++;
-              }
+            const incoming = {
+              profilePicUrl: c?.profilePicUrl ?? null,
+              about: typeof c?.about === 'string' && c.about.length ? c.about : null,
+            };
+            const ex = existingByDigits.get(digits) || {};
+            const diff = diffFillOnly(ex, incoming);
+            if (Object.keys(diff).length) {
+              const changed = changedFields(ex, diff);
+              eops.push({
+                ref: contactsCol.doc(docIdForDigits(digits)),
+                update: {
+                  ...diff,
+                  enrichedAt: FieldValue.serverTimestamp(),
+                  ...(changed.length ? { enrichedFields: FieldValue.arrayUnion(...changed) } : {}),
+                  updatedAt: FieldValue.serverTimestamp(),
+                },
+              });
+              enrichUpdated++;
             }
-            if (eops.length) await batchedSetOrUpdate(db, eops);
           }
-          phases.enrich = { ok: true, updated: enrichUpdated, error: null };
-        } catch (e) {
-          phases.enrich = { ok: false, updated: 0, error: String(e?.message || e) };
+          if (eops.length) await batchedSetOrUpdate(db, eops);
         }
+        phases.enrich = { ok: true, updated: enrichUpdated, error: null };
       }
 
       res.json({
@@ -287,9 +294,9 @@ export function buildContactsRouter({ db, sessions, requireUser, ensureAllowed }
 
   // ---------- JOB: FULL SYNC (contacts only) ----------
   // POST /contacts/sync/start
-  // body: { accountId, label, messagesLimit?: number }  // messagesLimit ignored; kept for compatibility
+  // body: { accountId, label }    // messagesLimit removed (ignored if client sends it)
   r.post('/contacts/sync/start', requireUser, async (req, res) => {
-    const { accountId, label, messagesLimit } = req.body || {};
+    const { accountId, label } = req.body || {};
     if (!accountId || !label) return res.status(400).json({ error: 'accountId, label required' });
 
     const allowed = await ensureAllowed(req, res, accountId, label);
@@ -309,15 +316,13 @@ export function buildContactsRouter({ db, sessions, requireUser, ensureAllowed }
       startedAt: null,
       finishedAt: null,
       lastUpdatedAt: null,
-      params: { messagesLimit: Math.max(1, Math.min(100, Number(messagesLimit) || 10)) }, // unused
+      params: {}, // messagesLimit removed
       storage: { store: 'firestore', path: `/accounts/${accountId}/sessions/${label}/*` },
-      // Stages (no chat stage)
       stages: [
         makeStage('read_contacts',   'Read contacts (no details)'),
         makeStage('write_contacts',  'Write/merge contacts'),
         makeStage('enrich_contacts', 'Enrich pics/about (fill-only)'),
       ],
-      // Summaries
       summary: { contactsAppended: 0, contactsUpdated: 0, enrichUpdated: 0 },
       error: null,
     };
@@ -344,11 +349,12 @@ export function buildContactsRouter({ db, sessions, requireUser, ensureAllowed }
     res.json({ ok: true, job });
   });
 
-  // ---------- JOB: NUMBERS WORKFLOW (unchanged) ----------
-  // POST /contacts/enrich/start  (backwards-compatible route name)
-  // body: { accountId, label, numbers: string[] }
-  r.post('/contacts/enrich/start', requireUser, async (req, res) => {
-    const { accountId, label, numbers } = req.body || {};
+  // ---------- JOB: LOOKUP (bulk numbers → upsert → enrich-missing) ----------
+  // CANONICAL: POST /contacts/lookup/start
+  // body: { accountId, label, numbers: string[], countryCode?: string }
+  // Alias maintained: POST /contacts/enrich/start (old name)
+  async function startLookupJob(req, res) {
+    const { accountId, label, numbers, countryCode = null } = req.body || {};
     if (!accountId || !label || !Array.isArray(numbers) || numbers.length === 0) {
       return res.status(400).json({ error: 'accountId, label, numbers[] required' });
     }
@@ -365,14 +371,14 @@ export function buildContactsRouter({ db, sessions, requireUser, ensureAllowed }
 
     const job = {
       id: jobId,
-      kind: 'numbers',
+      kind: 'lookup', // renamed from 'numbers'
       accountId, label,
       status: 'queued',
       createdAt: Date.now(),
       startedAt: null,
       finishedAt: null,
       lastUpdatedAt: null,
-      params: { numbers },
+      params: { numbers, countryCode },
       storage: { store: 'firestore', path: `/accounts/${accountId}/sessions/${label}/contacts/*` },
       stages: [
         makeStage('normalize_numbers', 'Normalize input numbers'),
@@ -387,25 +393,32 @@ export function buildContactsRouter({ db, sessions, requireUser, ensureAllowed }
     JOBS.set(jobId, job);
     if (!QUEUES.has(key)) QUEUES.set(key, []);
     QUEUES.get(key).push(jobId);
-    runQueueForKey({ key, db, sessions }).catch((e) => console.error('[enrich runner] unexpected error:', e));
+    runQueueForKey({ key, db, sessions }).catch((e) => console.error('[lookup runner] unexpected error:', e));
 
+    // For back-compat we keep these nulls; callers can ignore them.
     res.json({ ok: true, jobId, presentCount: null, absentCount: null });
-  });
+  }
+  r.post('/contacts/lookup/start', requireUser, startLookupJob);
+  r.post('/contacts/enrich/start', requireUser, startLookupJob); // alias/back-compat
 
-  r.get('/contacts/enrich/status', requireUser, async (req, res) => {
+  function getLookupStatus(req, res) {
     const accountId = String(req.query.accountId || '');
     const label = String(req.query.label || '');
     const jobId = String(req.query.jobId || '');
     if (!accountId || !label || !jobId) return res.status(400).json({ error: 'accountId, label, jobId required' });
 
-    const allowed = await ensureAllowed(req, res, accountId, label);
-    if (!allowed) return;
+    return (async () => {
+      const allowed = await ensureAllowed(req, res, accountId, label);
+      if (!allowed) return;
 
-    const job = JOBS.get(jobId);
-    if (!job || job.accountId !== accountId || job.label !== label) return res.status(404).json({ error: 'job_not_found' });
+      const job = JOBS.get(jobId);
+      if (!job || job.accountId !== accountId || job.label !== label) return res.status(404).json({ error: 'job_not_found' });
 
-    res.json({ ok: true, job });
-  });
+      res.json({ ok: true, job });
+    })().catch((e) => res.status(500).json({ error: 'status_failed', detail: String(e?.message || e) }));
+  }
+  r.get('/contacts/lookup/status', requireUser, getLookupStatus);
+  r.get('/contacts/enrich/status', requireUser, getLookupStatus); // alias/back-compat
 
   return r;
 }
@@ -428,8 +441,8 @@ async function runQueueForKey({ key, db, sessions }) {
       try {
         if (job.kind === 'fullsync') {
           await processFullSyncJob({ job, db, sessions });
-        } else if (job.kind === 'numbers') {
-          await processNumbersJob({ job, db, sessions });
+        } else if (job.kind === 'lookup' || job.kind === 'numbers') {
+          await processLookupJob({ job, db, sessions }); // unified processor
         } else {
           throw new Error(`unknown job kind: ${job.kind}`);
         }
@@ -454,89 +467,31 @@ async function processFullSyncJob({ job, db, sessions }) {
   // Stage 1: read_contacts
   stageSet(job, 'read_contacts', { status: 'running', startedAt: Date.now() });
   const all = await sessions.getContacts({ accountId, label, withDetails: false });
-
-  // STRICT filter: private + isMyContact + isWAContact + @c.us
-  const subset = all.filter(
-    (c) =>
-      c?.type === 'private' &&
-      !!c?.isMyContact &&
-      !!c?.isWAContact &&
-      typeof c?.id === 'string' &&
-      waIdIsCUs(c.id)
-  );
-
-  const digitsList = subset.map((c) => numberFromContact(c)).filter(Boolean);
+  const subset = filterStrictCUs(all);
+  const digitsList = digitsForList(subset);
   stageSet(job, 'read_contacts', { status: 'done', finishedAt: Date.now(), total: subset.length, done: subset.length });
 
   // Stage 2: write_contacts
   stageSet(job, 'write_contacts', { status: 'running', startedAt: Date.now(), total: subset.length, done: 0 });
-  const docRefs = digitsList.map((d) => contactsCol.doc(docIdForDigits(d)));
-  const existingSnaps = docRefs.length ? await batchedGetAll(db, docRefs, 300) : [];
-  const existingByDigits = new Map();
-  for (let i = 0; i < existingSnaps.length; i++) {
-    const d = digitsList[i];
-    const snap = existingSnaps[i];
-    if (d && snap?.exists) existingByDigits.set(d, snap.data());
-  }
+  const existingByDigits = await snapshotExistingByDigits(db, contactsCol, digitsList);
 
-  const ops = [];
-  let appended = 0, updated = 0;
-  for (let i = 0; i < subset.length; i++) {
-    const c = subset[i];
-    const digits = digitsList[i];
-    if (!digits) continue;
+  const { ops, appended, updated, appendedDigits } =
+    upsertContactsOps(subset, digitsList, existingByDigits, contactsCol);
 
-    const ref = contactsCol.doc(docIdForDigits(digits));
-    const incoming = {
-      id: c.id,
-      number: digits,
-      name: c?.name || null,
-      pushname: c?.pushname || null,
-      shortName: c?.shortName || null,
-      isWAContact: !!c?.isWAContact,
-      isMyContact: !!c?.isMyContact,
-      isBusiness: !!c?.isBusiness,
-      isEnterprise: !!c?.isEnterprise,
-      hasChat: !!c?.hasChat,
-      registered: true,
-      type: 'private',
-      updatedAt: FieldValue.serverTimestamp(),
-    };
-    const existing = existingByDigits.get(digits);
-    if (!existing) {
-      ops.push({ ref, set: { ...incoming, createdAt: FieldValue.serverTimestamp() } });
-      appended++;
-    } else {
-      const baseDiff = diffFillOnly(existing, incoming);
-      for (const f of ALWAYS_UPDATE_FLAGS) {
-        if (incoming[f] !== undefined && incoming[f] !== existing[f]) baseDiff[f] = incoming[f];
-      }
-      if (Object.keys(baseDiff).length) {
-        ops.push({ ref, update: { ...baseDiff, updatedAt: FieldValue.serverTimestamp() } });
-        updated++;
-      }
-    }
-  }
   if (ops.length) await batchedSetOrUpdate(db, ops);
   stageSet(job, 'write_contacts', { status: 'done', finishedAt: Date.now(), done: subset.length });
   job.summary.contactsAppended = appended;
   job.summary.contactsUpdated = updated;
 
-  // Stage 3: enrich_contacts
+  // Stage 3: enrich_contacts (no re-read; use existingByDigits + appendedDigits)
   stageSet(job, 'enrich_contacts', { status: 'running', startedAt: Date.now() });
   let enrichUpdated = 0;
+
   if (subset.length) {
-    const refSnaps = docRefs.length ? await batchedGetAll(db, docRefs, 300) : [];
-    const existingMap = new Map();
-    for (let i = 0; i < refSnaps.length; i++) {
-      const d = digitsList[i];
-      const snap = refSnaps[i];
-      if (d && snap?.exists) existingMap.set(d, snap.data());
-    }
     const needEnrich = subset.filter((c, i) => {
       const d = digitsList[i];
-      const ex = existingMap.get(d);
-      return ex && (!ex.profilePicUrl && !ex.about);
+      const ex = existingByDigits.get(d);
+      return appendedDigits.has(d) || (ex && !ex.profilePicUrl && !ex.about);
     });
 
     if (needEnrich.length) {
@@ -546,14 +501,14 @@ async function processFullSyncJob({ job, db, sessions }) {
         const digits = numberFromContact(c);
         if (!digits || !waIdIsCUs(c?.id)) continue;
 
-        const existing = existingMap.get(digits) || {};
+        const ex = existingByDigits.get(digits) || {};
         const incoming = {
           profilePicUrl: c?.profilePicUrl ?? null,
           about: typeof c?.about === 'string' && c.about.length ? c.about : null,
         };
-        const diff = diffFillOnly(existing, incoming);
+        const diff = diffFillOnly(ex, incoming);
         if (Object.keys(diff).length) {
-          const changed = changedFields(existing, diff);
+          const changed = changedFields(ex, diff);
           eops.push({
             ref: contactsCol.doc(docIdForDigits(digits)),
             update: {
@@ -569,17 +524,19 @@ async function processFullSyncJob({ job, db, sessions }) {
       if (eops.length) await batchedSetOrUpdate(db, eops);
     }
   }
+
   job.summary.enrichUpdated = enrichUpdated;
   stageSet(job, 'enrich_contacts', { status: 'done', finishedAt: Date.now(), done: enrichUpdated });
 }
 
-async function processNumbersJob({ job, db, sessions }) {
+async function processLookupJob({ job, db, sessions }) {
   const { accountId, label } = job;
   const { contacts: contactsCol } = sessRefs(db, accountId, label);
+  const countryCode = job?.params?.countryCode ?? null;
 
   // Stage 1: normalize_numbers
   stageSet(job, 'normalize_numbers', { status: 'running', startedAt: Date.now() });
-  const input = Array.isArray(job.params.numbers) ? job.params.numbers : [];
+  const input = Array.isArray(job.params?.numbers) ? job.params.numbers : [];
   const normalized = input.map((x) => normalizeDigits(x)).filter(Boolean);
   stageSet(job, 'normalize_numbers', { status: 'done', finishedAt: Date.now(), total: input.length, done: normalized.length });
   job.summary.normalized = normalized.length;
@@ -590,7 +547,7 @@ async function processNumbersJob({ job, db, sessions }) {
     accountId,
     label,
     numbers: normalized,
-    countryCode: null,
+    countryCode,       // NEW: forwarded if provided
     withDetails: true,
   });
   const registeredCount = results.reduce((n, r) => (r?.registered ? n + 1 : n), 0);
@@ -612,6 +569,8 @@ async function processNumbersJob({ job, db, sessions }) {
 
   const ops = [];
   let written = 0;
+  const appendedDigits = new Set();
+
   for (const r of results) {
     const digits = normalizeDigits(r.normalized || r.input);
     if (!digits) continue;
@@ -641,6 +600,7 @@ async function processNumbersJob({ job, db, sessions }) {
     if (!existing) {
       ops.push({ ref, set: { ...payload, createdAt: FieldValue.serverTimestamp() } });
       written++;
+      appendedDigits.add(digits);
     } else {
       // fill-only for details, but always refresh flags (registered, isWAContact, hasChat, isMyContact)
       const baseDiff = diffFillOnly(existing, payload);
@@ -659,23 +619,24 @@ async function processNumbersJob({ job, db, sessions }) {
   stageSet(job, 'write_numbers', { status: 'done', finishedAt: Date.now(), done: results.length });
   job.summary.written = written;
 
-  // Stage 4: enrich_missing (registered only, and only if both fields missing)
+  // Stage 4: enrich_missing (registered only, and only if both fields missing) — no re-read
   stageSet(job, 'enrich_missing', { status: 'running', startedAt: Date.now() });
-  const refSnaps = docRefs.length ? await batchedGetAll(db, docRefs, 300) : [];
+  let enrichUpdated = 0;
+
+  // Build a cheap view from existingByDigits + appendedDigits
   const need = [];
-  const mapByDigits = new Map();
-  for (let i = 0; i < refSnaps.length; i++) {
-    const d = normalized[i];
-    const snap = refSnaps[i];
-    const ex = snap?.exists ? snap.data() : null;
-    if (!ex) continue;
-    mapByDigits.set(d, ex);
-    if (ex.registered && !ex.profilePicUrl && !ex.about && ex.id && waIdIsCUs(ex.id)) {
-      need.push({ id: ex.id, number: ex.number, type: 'private' });
+  for (const r of results) {
+    const digits = normalizeDigits(r.normalized || r.input);
+    if (!digits) continue;
+    const ex = existingByDigits.get(digits);
+    const should = appendedDigits.has(digits) || (!!ex && ex.registered && !ex.profilePicUrl && !ex.about && ex.id && waIdIsCUs(ex.id));
+    if (should) {
+      // minimal object for enrich API
+      const waId = (r.waId && waIdIsCUs(r.waId)) ? r.waId : ex?.id;
+      if (waId && waIdIsCUs(waId)) need.push({ id: waId, number: digits, type: 'private' });
     }
   }
 
-  let enrichUpdated = 0;
   if (need.length) {
     const enriched = await sessions.enrichContactsSequential({ accountId, label, contacts: need });
     const eops = [];
@@ -683,14 +644,14 @@ async function processNumbersJob({ job, db, sessions }) {
       const digits = numberFromContact(c);
       if (!digits || !waIdIsCUs(c?.id)) continue;
 
-      const existing = mapByDigits.get(digits) || {};
+      const ex = existingByDigits.get(digits) || {};
       const incoming = {
         profilePicUrl: c?.profilePicUrl ?? null,
         about: typeof c?.about === 'string' && c.about.length ? c.about : null,
       };
-      const diff = diffFillOnly(existing, incoming);
+      const diff = diffFillOnly(ex, incoming);
       if (Object.keys(diff).length) {
-        const changed = changedFields(existing, diff);
+        const changed = changedFields(ex, diff);
         eops.push({
           ref: contactsCol.doc(docIdForDigits(digits)),
           update: {
@@ -705,6 +666,7 @@ async function processNumbersJob({ job, db, sessions }) {
     }
     if (eops.length) await batchedSetOrUpdate(db, eops);
   }
+
   job.summary.enrichUpdated = enrichUpdated;
   stageSet(job, 'enrich_missing', { status: 'done', finishedAt: Date.now(), done: enrichUpdated });
 }
