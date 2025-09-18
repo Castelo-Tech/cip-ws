@@ -1,4 +1,3 @@
-// routes/contacts.js
 import { Router } from 'express';
 
 /**
@@ -115,20 +114,46 @@ export function buildContactsRouter({ sessions, requireUser, ensureAllowed, buck
     if (st !== 'ready') return res.status(409).json({ error: 'session not ready', status: st || null });
 
     try {
+      // Fetch everything per current flag
       const allContacts = await sessions.getContacts({ accountId, label, withDetails });
 
-      // Build stats for UI
+      // Stats for UI
       const statsAll = buildStats(allContacts);
 
       // Previous step: type === "private"
       const privOnly = allContacts.filter((c) => c?.type === 'private');
 
-      // NEW: narrow further to isMyContact === true AND isWAContact === true
-      const persistCandidates = privOnly.filter(
+      // Narrow to isMyContact && isWAContact
+      let persistCandidates = privOnly.filter(
         (c) => !!c?.isMyContact && !!c?.isWAContact
       );
 
-      const statsPrivate = buildStats(privOnly);
+      // If subset is modest (<=500), enrich JUST those with avatar+bio regardless of ?details
+      let enrichment = { attempted: 0, enriched: 0 };
+      if (persistCandidates.length > 0 && persistCandidates.length <= 500) {
+        try {
+          enrichment.attempted = persistCandidates.length;
+          const enriched = await sessions.enrichContacts({
+            accountId,
+            label,
+            contacts: persistCandidates,
+          });
+
+          // Count how many actually gained new info
+          const gained = enriched.filter((e, idx) => {
+            const prev = persistCandidates[idx] || {};
+            return (e.profilePicUrl && !prev.profilePicUrl) || (e.about && !prev.about);
+          }).length;
+
+          enrichment.enriched = gained;
+          persistCandidates = enriched;
+        } catch (e) {
+          // keep going with the un-enriched set
+          console.warn('[contacts] enrichment failed, proceeding with base contacts:', e?.message || e);
+        }
+      }
+
+      const statsPrivate   = buildStats(privOnly);
       const statsPersisted = buildStats(persistCandidates);
 
       // --- Write contacts.json (filtered set) to GCS bucket under per-session path ---
@@ -141,6 +166,7 @@ export function buildContactsRouter({ sessions, requireUser, ensureAllowed, buck
         totalStored: null,  // final contacts count in stored file
         error: null,
         filter: { type: 'private', isMyContact: true, isWAContact: true },
+        enrichment,         // report what we tried
       };
 
       if (bucket) {
@@ -188,6 +214,7 @@ export function buildContactsRouter({ sessions, requireUser, ensureAllowed, buck
             totalStored: merged.length,
             error: null,
             filter: storageInfo.filter,
+            enrichment: storageInfo.enrichment,
           };
         } catch (e) {
           storageInfo = {
@@ -199,6 +226,7 @@ export function buildContactsRouter({ sessions, requireUser, ensureAllowed, buck
             totalStored: null,
             error: String(e?.message || e),
             filter: storageInfo.filter,
+            enrichment: storageInfo.enrichment,
           };
           // We don't fail the endpoint if storage write fails — we still return contacts & stats.
           console.error('[contacts] storage write failed:', e);
@@ -209,11 +237,11 @@ export function buildContactsRouter({ sessions, requireUser, ensureAllowed, buck
       res.json({
         ok: true,
         count: allContacts.length,
-        contacts: allContacts,   // unchanged: contains everything the method gathered
+        contacts: allContacts,   // untouched: everything the method gathered (withDetails param still respected)
         stats: {
           all: statsAll,
           privateOnly: statsPrivate,
-          persisted: statsPersisted, // NEW: stats for the actually persisted subset
+          persisted: statsPersisted,
         },
         storage: storageInfo,
       });
