@@ -157,7 +157,12 @@ export function buildContactsRouter({ db, sessions, requireUser, ensureAllowed }
       // ---- Phase 1: CONTACTS (no details) ----
       const all = await sessions.getContacts({ accountId, label, withDetails: false });
       const subset = all.filter(
-        (c) => c?.type !== 'group' && !!c?.isWAContact && typeof c?.id === 'string' && waIdIsCUs(c.id)
+        (c) =>
+          c?.type === 'private' &&
+          !!c?.isMyContact &&
+          !!c?.isWAContact &&
+          typeof c?.id === 'string' &&
+          waIdIsCUs(c.id)
       );
 
       const { contacts: contactsCol, chats: chatsCol } = sessRefs(db, accountId, label);
@@ -536,7 +541,14 @@ async function processFullSyncJob({ job, db, sessions }) {
   // Stage 1: read_contacts
   stageSet(job, 'read_contacts', { status: 'running', startedAt: Date.now() });
   const all = await sessions.getContacts({ accountId, label, withDetails: false });
-  const subset = all.filter((c) => c?.type !== 'group' && !!c?.isWAContact && typeof c?.id === 'string' && waIdIsCUs(c.id));
+  const subset = all.filter(
+    (c) =>
+      c?.type === 'private' &&
+      !!c?.isMyContact &&
+      !!c?.isWAContact &&
+      typeof c?.id === 'string' &&
+      waIdIsCUs(c.id)
+  );
   const digitsList = subset.map((c) => numberFromContact(c)).filter(Boolean);
   stageSet(job, 'read_contacts', { status: 'done', finishedAt: Date.now(), total: subset.length, done: subset.length });
 
