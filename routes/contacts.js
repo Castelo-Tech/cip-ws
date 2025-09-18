@@ -175,7 +175,15 @@ export function buildContactsRouter({ sessions, requireUser, ensureAllowed, buck
 
     try {
       const all = await sessions.getContacts({ accountId, label, withDetails: false });
-      const subset = all.filter((c) => c?.type === 'private' && !!c?.isMyContact && !!c?.isWAContact);
+
+      const subset = all.filter(
+        (c) =>
+          c?.type === 'private' &&
+          !!c?.isMyContact &&
+          !!c?.isWAContact &&
+          typeof c?.id === 'string' &&
+          c.id.endsWith('@c.us')
+      );
 
       let storageInfo = {
         ok: false,
@@ -416,7 +424,9 @@ async function processJob({ job, sessions, bucket }) {
     };
     await saveJson(enrichedFile, enriched);
   }
-  const baseContacts = Array.isArray(enriched.contacts) ? enriched.contacts : [];
+
+  let baseContacts = Array.isArray(enriched.contacts) ? enriched.contacts : [];
+  baseContacts = baseContacts.filter((c) => !c?.id || String(c.id).endsWith('@c.us'));
 
   // Build lookup maps for present contacts
   const byNumber = new Map(baseContacts.map((c) => [numberFromContact(c), c]));
@@ -460,9 +470,13 @@ async function processJob({ job, sessions, bucket }) {
     });
 
     if (result?.registered && result?.waId) {
-      // Map to our contact shape (private)
+      const waId = String(result.waId || '');
+      if (!waId.endsWith('@c.us')) {
+        job.progress.absentDone += 1;
+        continue; // skip @lid and anything else
+      }
       const contact = {
-        id: result.waId,
+        id: waId,
         number: result.normalized || n,
         name: result.contact?.name || null,
         pushname: result.contact?.pushname || null,
