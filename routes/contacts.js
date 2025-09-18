@@ -1,8 +1,6 @@
 // routes/contacts.js
 import { Router } from 'express';
-import {
-  FieldValue,
-} from 'firebase-admin/firestore';
+import { FieldValue } from 'firebase-admin/firestore';
 import { sleep, rand } from '../lib/session/utils.js';
 
 // ===== Path + id helpers (session-scoped Firestore structure) =====
@@ -31,66 +29,10 @@ function numberFromContact(c) {
   if (id.endsWith('@c.us')) return normalizeDigits(id.split('@')[0]);
   return '';
 }
-function docIdForDigits(digits) {
-  return normalizeDigits(digits); // contact/chat docId = numeric phone
-}
-function waIdIsCUs(id) {
-  return typeof id === 'string' && id.endsWith('@c.us');
-}
+function docIdForDigits(digits) { return normalizeDigits(digits); }
+function waIdIsCUs(id) { return typeof id === 'string' && id.endsWith('@c.us'); }
 
-// ===== Merge helpers (fill-only upsert; returns {merged, appended, updated}) =====
-function upsertMerge(existingArr = [], incomingArr = []) {
-  const keyOf = (c) => (c?.id && String(c.id)) || (c?.number && String(c.number)) || null;
-
-  const map = new Map();
-  for (const c of existingArr) {
-    const k = keyOf(c);
-    if (k) map.set(k, { ...c });
-  }
-
-  let appended = 0;
-  let updated = 0;
-
-  for (const inc of incomingArr) {
-    const k = keyOf(inc);
-    if (!k) continue;
-
-    if (!map.has(k)) {
-      map.set(k, { ...inc });
-      appended++;
-      continue;
-    }
-
-    const cur = map.get(k);
-    let changed = false;
-
-    for (const [field, value] of Object.entries(inc)) {
-      const curVal = cur[field];
-      const wantOverwrite =
-        (curVal === null || curVal === undefined || curVal === '') ||
-        ((field === 'profilePicUrl' || field === 'about') && !curVal && !!value);
-
-      if (wantOverwrite && value !== undefined) {
-        cur[field] = value;
-        changed = true;
-      }
-    }
-
-    if (changed) {
-      map.set(k, cur);
-      updated++;
-    }
-  }
-
-  const merged = Array.from(map.values()).sort((a, b) => {
-    const ka = String(a.number || a.id || '');
-    const kb = String(b.number || b.id || '');
-    return ka.localeCompare(kb);
-  });
-
-  return { merged, appended, updated };
-}
-
+// ===== Stats (for response) =====
 function buildStats(list = []) {
   const total = list.length;
   const countIf = (fn) => list.reduce((n, x) => (fn(x) ? n + 1 : n), 0);
@@ -113,7 +55,6 @@ function buildStats(list = []) {
   const fieldSet = new Set();
   for (const c of list) Object.keys(c || {}).forEach((k) => fieldSet.add(k));
   const fields = Array.from(fieldSet).sort();
-
   return { total, byType, flags, details, fields };
 }
 
@@ -130,7 +71,6 @@ function diffFillOnly(existing, incoming) {
   }
   return out;
 }
-
 function changedFields(existing, updates) {
   const changed = [];
   for (const [k, v] of Object.entries(updates)) {
@@ -139,7 +79,6 @@ function changedFields(existing, updates) {
   }
   return changed;
 }
-
 async function batchedSetOrUpdate(db, ops) {
   // ops: array of {ref, set?:object, update?:object}
   // Firestore batch limit = 500 writes; chunk to ~450
@@ -154,61 +93,78 @@ async function batchedSetOrUpdate(db, ops) {
     await batch.commit();
   }
 }
+async function batchedGetAll(db, refs, chunk = 300) {
+  const snaps = [];
+  for (let i = 0; i < refs.length; i += chunk) {
+    const slice = refs.slice(i, i + chunk);
+    const part = slice.length ? await db.getAll(...slice) : [];
+    snaps.push(...part);
+  }
+  return snaps;
+}
 
-// ===== In-memory job management (unchanged API) =====
+// ===== Fields we always refresh (not fill-only) =====
+const ALWAYS_UPDATE_FLAGS = new Set(['registered', 'isWAContact', 'isMyContact', 'hasChat']);
+
+// ===== In-memory job management =====
 const JOBS = new Map(); // jobId -> job object
 const QUEUES = new Map(); // key accountId::label -> [jobId]
 const RUNNING = new Set(); // keys currently running
 
-function queueKey({ accountId, label }) {
-  return `${accountId}::${label}`;
+function queueKey({ accountId, label }) { return `${accountId}::${label}`; }
+function makeJobId() { return `job_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`; }
+
+function makeStage(key, label) {
+  return { key, label, status: 'pending', total: 0, done: 0, error: null, startedAt: null, finishedAt: null };
 }
-function makeJobId() {
-  return `job_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+function stageSet(job, key, patch) {
+  const st = job.stages.find((s) => s.key === key);
+  if (!st) return;
+  Object.assign(st, patch);
+  job.lastUpdatedAt = Date.now();
 }
 
 // ===== Router =====
 export function buildContactsRouter({ db, sessions, requireUser, ensureAllowed }) {
   const r = Router();
 
-  // ---------- GET /contacts ----------
-  // - Pull live contacts from WA (optional details with pics/about via ?details=1).
-  // - Filter to private + isMyContact + isWAContact + @c.us
-  // - Upsert into Firestore under /accounts/{aid}/sessions/{label}/contacts/{digits}
-  // - Optionally also persist chats (+ last N messages) for contacts that have a chat (?includeChats=1&messagesLimit=10)
+  // ---------- GET /contacts (kept for ad-hoc/manual runs) ----------
+  // Sequential (non-job) run:
+  //   1) contacts (no details)
+  //   2) chats (+ last N messages)
+  //   3) enrichment (pics/about) fill-only
   r.get('/contacts', requireUser, async (req, res) => {
     const accountId = String(req.query.accountId || '');
     const label = String(req.query.label || '');
     const includeChats = String(req.query.includeChats || '') === '1';
-    const includeDetails = ['1', 'true', 'yes'].includes(String(req.query.details || '').toLowerCase());
+    const wantDetailsAtEnd = ['1', 'true', 'yes'].includes(String(req.query.details || '').toLowerCase());
     const messagesLimit = Math.max(1, Math.min(100, Number(req.query.messagesLimit) || 10));
 
     if (!accountId || !label) return res.status(400).json({ error: 'accountId, label required' });
-
     const allowed = await ensureAllowed(req, res, accountId, label);
     if (!allowed) return;
 
     const st = sessions.status({ accountId, label });
     if (st !== 'ready') return res.status(409).json({ error: 'session not ready', status: st || null });
 
-    try {
-      const all = await sessions.getContacts({ accountId, label, withDetails: includeDetails });
+    const phases = {
+      contacts: { ok: false, appended: 0, updated: 0 },
+      chats: { ok: !includeChats, chatsPersisted: 0, messagesPersisted: 0, error: null },
+      enrich: { ok: !wantDetailsAtEnd, updated: 0, error: null },
+    };
 
+    try {
+      // ---- Phase 1: CONTACTS (no details) ----
+      const all = await sessions.getContacts({ accountId, label, withDetails: false });
       const subset = all.filter(
-        (c) =>
-          c?.type === 'private' &&
-          !!c?.isMyContact &&
-          !!c?.isWAContact &&
-          typeof c?.id === 'string' &&
-          waIdIsCUs(c.id)
+        (c) => c?.type !== 'group' && !!c?.isWAContact && typeof c?.id === 'string' && waIdIsCUs(c.id)
       );
 
-      // Prepare existing docs map (by digits)
       const { contacts: contactsCol, chats: chatsCol } = sessRefs(db, accountId, label);
-
       const digitsList = subset.map((c) => numberFromContact(c)).filter(Boolean);
+
       const docRefs = digitsList.map((d) => contactsCol.doc(docIdForDigits(d)));
-      const existingSnaps = docRefs.length ? await db.getAll(...docRefs) : [];
+      const existingSnaps = docRefs.length ? await batchedGetAll(db, docRefs, 300) : [];
       const existingByDigits = new Map();
       for (let i = 0; i < existingSnaps.length; i++) {
         const d = digitsList[i];
@@ -216,11 +172,8 @@ export function buildContactsRouter({ db, sessions, requireUser, ensureAllowed }
         if (d && snap?.exists) existingByDigits.set(d, snap.data());
       }
 
-      // Build upserts
       const ops = [];
-      let appended = 0;
-      let updated = 0;
-
+      let appended = 0, updated = 0;
       for (let i = 0; i < subset.length; i++) {
         const c = subset[i];
         const digits = digitsList[i];
@@ -238,53 +191,32 @@ export function buildContactsRouter({ db, sessions, requireUser, ensureAllowed }
           isBusiness: !!c?.isBusiness,
           isEnterprise: !!c?.isEnterprise,
           hasChat: !!c?.hasChat,
+          registered: true, // for real WA contacts from device
           type: 'private',
-          // If includeDetails=true we will try to keep pics/about (fill-only)
-          ...(includeDetails ? {
-            profilePicUrl: c?.profilePicUrl ?? null,
-            about: (typeof c?.about === 'string' && c.about.length) ? c.about : null,
-          } : {}),
           updatedAt: FieldValue.serverTimestamp(),
         };
 
         const existing = existingByDigits.get(digits);
         if (!existing) {
-          ops.push({
-            ref,
-            set: {
-              ...incoming,
-              createdAt: FieldValue.serverTimestamp(),
-              ...(includeDetails ? { enrichedAt: FieldValue.serverTimestamp(), enrichedFields: ['profilePicUrl', 'about'] } : {}),
-            },
-          });
+          ops.push({ ref, set: { ...incoming, createdAt: FieldValue.serverTimestamp() } });
           appended++;
         } else {
-          // fill-only on pics/about; always refresh hasChat
+          // fill-only for most fields, but ALWAYS update core flags if changed
           const baseDiff = diffFillOnly(existing, incoming);
-          const needsHasChatUpdate = incoming.hasChat !== existing.hasChat;
-          const updateObj = { ...baseDiff };
-          if (needsHasChatUpdate) updateObj.hasChat = incoming.hasChat;
-          if (Object.keys(updateObj).length) {
-            // enriched fields bookkeeping if any of those changed
-            const ch = changedFields(existing, updateObj);
-            ops.push({
-              ref,
-              update: {
-                ...updateObj,
-                ...(ch.length ? { enrichedAt: FieldValue.serverTimestamp(), enrichedFields: FieldValue.arrayUnion(...ch) } : {}),
-                updatedAt: FieldValue.serverTimestamp(),
-              },
-            });
+          for (const f of ALWAYS_UPDATE_FLAGS) {
+            if (incoming[f] !== undefined && incoming[f] !== existing[f]) baseDiff[f] = incoming[f];
+          }
+          if (Object.keys(baseDiff).length) {
+            ops.push({ ref, update: { ...baseDiff, updatedAt: FieldValue.serverTimestamp() } });
             updated++;
           }
         }
       }
-
       if (ops.length) await batchedSetOrUpdate(db, ops);
+      phases.contacts = { ok: true, appended, updated };
 
-      // Optional: persist chats for contacts that have a chat (and optionally their last N messages)
-      let chatsPersisted = 0;
-      let messagesPersisted = 0;
+      // ---- Phase 2: CHATS + MESSAGES ----
+      let chatsPersisted = 0, messagesPersisted = 0;
       if (includeChats) {
         try {
           const numbersWithChat = subset
@@ -297,41 +229,38 @@ export function buildContactsRouter({ db, sessions, requireUser, ensureAllowed }
               label,
               numbers: numbersWithChat,
               countryCode: null,
-              withMessages: messagesLimit > 0,
+              withMessages: true,
               messagesLimit,
             });
 
             const chatOps = [];
-            const msgOpsByChat = new Map(); // chatDocId -> ops[]
-
+            const msgOps = [];
             for (const r of results) {
               if (!r?.exists || !r?.waId || !waIdIsCUs(r.waId)) continue;
               const digits = normalizeDigits(r.normalized || r.input);
               if (!digits) continue;
 
               const chatDocId = docIdForDigits(digits);
-              const ref = chatsCol.doc(chatDocId);
+              const cref = chatsCol.doc(chatDocId);
               const payload = {
                 id: r.chat?.id || r.waId,
                 number: digits,
                 name: r.chat?.name || null,
-                isGroup: !!r.chat?.isGroup, // should be false for private
+                isGroup: !!r.chat?.isGroup,
                 unreadCount: r.chat?.unreadCount ?? null,
                 archived: !!r.chat?.archived,
                 pinned: !!r.chat?.pinned,
                 isReadOnly: !!r.chat?.isReadOnly,
                 updatedAt: FieldValue.serverTimestamp(),
               };
-              chatOps.push({ ref, set: { ...payload, createdAt: FieldValue.serverTimestamp() } });
+              chatOps.push({ ref: cref, set: { ...payload, createdAt: FieldValue.serverTimestamp() } });
 
-              // Persist last N messages if present
               if (Array.isArray(r.messages) && r.messages.length) {
                 const mcol = messagesCol(db, accountId, label, chatDocId);
-                const mOps = msgOpsByChat.get(chatDocId) || [];
                 for (const m of r.messages) {
                   if (!m?.id) continue;
                   const mref = mcol.doc(m.id);
-                  mOps.push({
+                  msgOps.push({
                     ref: mref,
                     set: {
                       id: m.id,
@@ -346,38 +275,67 @@ export function buildContactsRouter({ db, sessions, requireUser, ensureAllowed }
                     },
                   });
                 }
-                if (mOps.length) msgOpsByChat.set(chatDocId, mOps);
               }
             }
-
-            if (chatOps.length) {
-              await batchedSetOrUpdate(db, chatOps);
-              chatsPersisted = chatOps.length;
-            }
-            // Flatten and commit message ops in batches
-            const allMsgOps = Array.from(msgOpsByChat.values()).flat();
-            if (allMsgOps.length) {
-              await batchedSetOrUpdate(db, allMsgOps);
-              messagesPersisted = allMsgOps.length;
-            }
+            if (chatOps.length) { await batchedSetOrUpdate(db, chatOps); chatsPersisted = chatOps.length; }
+            if (msgOps.length)  { await batchedSetOrUpdate(db, msgOps);  messagesPersisted = msgOps.length; }
           }
+          phases.chats = { ok: true, chatsPersisted, messagesPersisted, error: null };
         } catch (e) {
-          // graceful: return success for contacts but note chat persistence error
-          return res.json({
-            ok: true,
-            count: subset.length,
-            contacts: subset,
-            stats: buildStats(subset),
-            persistence: {
-              store: 'firestore',
-              path: `/accounts/${accountId}/sessions/${label}/contacts/*`,
-              appended,
-              updated,
-              chatsPersisted: 0,
-              messagesPersisted: 0,
-              chatsError: String(e?.message || e),
-            },
+          phases.chats = { ok: false, chatsPersisted: 0, messagesPersisted: 0, error: String(e?.message || e) };
+        }
+      }
+
+      // ---- Phase 3: ENRICH (pics/about) ----
+      let enrichUpdated = 0;
+      if (wantDetailsAtEnd) {
+        try {
+          const refSnaps = docRefs.length ? await batchedGetAll(db, docRefs, 300) : [];
+          const existingMap = new Map();
+          for (let i = 0; i < refSnaps.length; i++) {
+            const d = digitsList[i];
+            const snap = refSnaps[i];
+            if (d && snap?.exists) existingMap.set(d, snap.data());
+          }
+
+          const needEnrich = subset.filter((c, i) => {
+            const d = digitsList[i];
+            const ex = existingMap.get(d);
+            return ex && (!ex.profilePicUrl && !ex.about);
           });
+
+          if (needEnrich.length) {
+            const enrichedList = await sessions.enrichContactsSequential({ accountId, label, contacts: needEnrich });
+            const eops = [];
+            for (const c of enrichedList) {
+              const digits = numberFromContact(c);
+              if (!digits || !waIdIsCUs(c?.id)) continue;
+
+              const existing = existingMap.get(digits) || {};
+              const incoming = {
+                profilePicUrl: c?.profilePicUrl ?? null,
+                about: typeof c?.about === 'string' && c.about.length ? c.about : null,
+              };
+              const diff = diffFillOnly(existing, incoming);
+              if (Object.keys(diff).length) {
+                const changed = changedFields(existing, diff);
+                eops.push({
+                  ref: sessRefs(db, accountId, label).contacts.doc(docIdForDigits(digits)),
+                  update: {
+                    ...diff,
+                    enrichedAt: FieldValue.serverTimestamp(),
+                    ...(changed.length ? { enrichedFields: FieldValue.arrayUnion(...changed) } : {}),
+                    updatedAt: FieldValue.serverTimestamp(),
+                  },
+                });
+                enrichUpdated++;
+              }
+            }
+            if (eops.length) await batchedSetOrUpdate(db, eops);
+          }
+          phases.enrich = { ok: true, updated: enrichUpdated, error: null };
+        } catch (e) {
+          phases.enrich = { ok: false, updated: 0, error: String(e?.message || e) };
         }
       }
 
@@ -389,32 +347,25 @@ export function buildContactsRouter({ db, sessions, requireUser, ensureAllowed }
         persistence: {
           store: 'firestore',
           path: `/accounts/${accountId}/sessions/${label}/contacts/*`,
-          appended,
-          updated,
-          chatsPersisted: includeChats ? chatsPersisted : 0,
-          messagesPersisted: includeChats ? messagesPersisted : 0,
+          appended: phases.contacts.appended,
+          updated: phases.contacts.updated,
+          chatsPersisted: phases.chats.chatsPersisted,
+          messagesPersisted: phases.chats.messagesPersisted,
+          enrichUpdated: phases.enrich.updated,
         },
+        phases,
       });
     } catch (e) {
       res.status(500).json({ error: 'contacts_failed', detail: String(e?.message || e) });
     }
   });
 
-  // ---------- POST /contacts/enrich/start ----------
-  // body: { accountId, label, numbers: string[] }
-  // - Splits numbers into present (in contacts collection) vs absent.
-  // - Enrich present (avatar/bio) with small jitter; add absent if registered.
-  // - Writes back to Firestore; marks enrichedAt + enrichedFields.
-  // NOTE: hard cap of 200 numbers per job (reject if above).
-  r.post('/contacts/enrich/start', requireUser, async (req, res) => {
-    const { accountId, label, numbers } = req.body || {};
-    if (!accountId || !label || !Array.isArray(numbers) || numbers.length === 0) {
-      return res.status(400).json({ error: 'accountId, label, numbers[] required' });
-    }
-
-    if (numbers.length > 200) {
-      return res.status(413).json({ error: 'too_many_numbers', limit: 200 });
-    }
+  // ---------- JOB: FULL SYNC ----------
+  // POST /contacts/sync/start
+  // body: { accountId, label, messagesLimit?: number (default 10) }
+  r.post('/contacts/sync/start', requireUser, async (req, res) => {
+    const { accountId, label, messagesLimit } = req.body || {};
+    if (!accountId || !label) return res.status(400).json({ error: 'accountId, label required' });
 
     const allowed = await ensureAllowed(req, res, accountId, label);
     if (!allowed) return;
@@ -422,84 +373,117 @@ export function buildContactsRouter({ db, sessions, requireUser, ensureAllowed }
     const st = sessions.status({ accountId, label });
     if (st !== 'ready') return res.status(409).json({ error: 'session not ready', status: st || null });
 
-    try {
-      const { contacts: contactsCol } = sessRefs(db, accountId, label);
-      // Load base contacts present in Firestore
-      const snap = await contactsCol.get();
-      const baseContacts = snap.docs
-        .map((d) => d.data())
-        .filter((c) => !c?.id || waIdIsCUs(c.id));
+    const jobId = makeJobId();
+    const key = queueKey({ accountId, label });
+    const job = {
+      id: jobId,
+      kind: 'fullsync',
+      accountId, label,
+      status: 'queued',
+      createdAt: Date.now(),
+      startedAt: null,
+      finishedAt: null,
+      lastUpdatedAt: null,
+      params: { messagesLimit: Math.max(1, Math.min(100, Number(messagesLimit) || 10)) },
+      storage: { store: 'firestore', path: `/accounts/${accountId}/sessions/${label}/*` },
+      // Stages
+      stages: [
+        makeStage('read_contacts',   'Read contacts (no details)'),
+        makeStage('write_contacts',  'Write/merge contacts'),
+        makeStage('persist_chats',   'Write chats (+ last N messages)'),
+        makeStage('enrich_contacts', 'Enrich pics/about (fill-only)'),
+      ],
+      // Summaries
+      summary: { contactsAppended: 0, contactsUpdated: 0, chatsPersisted: 0, messagesPersisted: 0, enrichUpdated: 0 },
+      error: null,
+    };
 
-      const presentNumbersSet = new Set(baseContacts.map((c) => numberFromContact(c)).filter(Boolean));
-      const inNumbers = numbers.map((x) => normalizeDigits(x)).filter(Boolean);
+    JOBS.set(jobId, job);
+    if (!QUEUES.has(key)) QUEUES.set(key, []);
+    QUEUES.get(key).push(jobId);
+    runQueueForKey({ key, db, sessions }).catch((e) => console.error('[sync runner] unexpected error:', e));
 
-      const present = [];
-      const absent = [];
-      for (const n of inNumbers) {
-        if (presentNumbersSet.has(n)) present.push(n);
-        else absent.push(n);
-      }
-
-      const jobId = makeJobId();
-      const key = queueKey({ accountId, label });
-      const job = {
-        id: jobId,
-        accountId,
-        label,
-        status: 'queued',
-        createdAt: Date.now(),
-        startedAt: null,
-        finishedAt: null,
-        input: { total: inNumbers.length, numbers: inNumbers },
-        sets: { present, absent },
-        progress: {
-          presentTotal: present.length,
-          presentDone: 0,
-          absentTotal: absent.length,
-          absentDone: 0,
-        },
-        storage: {
-          store: 'firestore',
-          path: `/accounts/${accountId}/sessions/${label}/contacts/*`,
-        },
-        error: null,
-      };
-
-      JOBS.set(jobId, job);
-      if (!QUEUES.has(key)) QUEUES.set(key, []);
-      QUEUES.get(key).push(jobId);
-
-      runQueueForKey({ key, db, sessions }).catch((e) => {
-        console.error('[enrich runner] unexpected error:', e);
-      });
-
-      res.json({
-        ok: true,
-        jobId,
-        presentCount: present.length,
-        absentCount: absent.length,
-      });
-    } catch (e) {
-      res.status(500).json({ error: 'enrich_start_failed', detail: String(e?.message || e) });
-    }
+    res.json({ ok: true, jobId });
   });
 
-  // ---------- GET /contacts/enrich/status ----------
-  r.get('/contacts/enrich/status', requireUser, async (req, res) => {
+  r.get('/contacts/sync/status', requireUser, async (req, res) => {
     const accountId = String(req.query.accountId || '');
     const label = String(req.query.label || '');
     const jobId = String(req.query.jobId || '');
+    if (!accountId || !label || !jobId) return res.status(400).json({ error: 'accountId, label, jobId required' });
 
-    if (!accountId || !label || !jobId) {
-      return res.status(400).json({ error: 'accountId, label, jobId required' });
-    }
     const allowed = await ensureAllowed(req, res, accountId, label);
     if (!allowed) return;
 
     const job = JOBS.get(jobId);
-    if (!job || job.accountId !== accountId || job.label !== label) {
-      return res.status(404).json({ error: 'job_not_found' });
+    if (!job || job.accountId !== accountId || job.label !== label) return res.status(404).json({ error: 'job_not_found' });
+    res.json({ ok: true, job });
+  });
+
+  // ---------- JOB: NUMBERS WORKFLOW (stage-based) ----------
+  // POST /contacts/enrich/start    (backwards-compatible route name)
+  // body: { accountId, label, numbers: string[] }
+  // Stages:
+  //  - normalize_numbers
+  //  - lookup_numbers (registered? hasChat? details)
+  //  - write_numbers (upsert; add unregistered too with registered=false)
+  //  - enrich_registered_missing (fill-only pictures/about for those needing it)
+  r.post('/contacts/enrich/start', requireUser, async (req, res) => {
+    const { accountId, label, numbers } = req.body || {};
+    if (!accountId || !label || !Array.isArray(numbers) || numbers.length === 0) {
+      return res.status(400).json({ error: 'accountId, label, numbers[] required' });
     }
+    if (numbers.length > 200) return res.status(413).json({ error: 'too_many_numbers', limit: 200 });
+
+    const allowed = await ensureAllowed(req, res, accountId, label);
+    if (!allowed) return;
+
+    const st = sessions.status({ accountId, label });
+    if (st !== 'ready') return res.status(409).json({ error: 'session not ready', status: st || null });
+
+    const jobId = makeJobId();
+    const key = queueKey({ accountId, label });
+
+    const job = {
+      id: jobId,
+      kind: 'numbers',
+      accountId, label,
+      status: 'queued',
+      createdAt: Date.now(),
+      startedAt: null,
+      finishedAt: null,
+      lastUpdatedAt: null,
+      params: { numbers },
+      storage: { store: 'firestore', path: `/accounts/${accountId}/sessions/${label}/contacts/*` },
+      stages: [
+        makeStage('normalize_numbers', 'Normalize input numbers'),
+        makeStage('lookup_numbers',    'Lookup & fetch details'),
+        makeStage('write_numbers',     'Upsert into contacts collection'),
+        makeStage('enrich_missing',    'Enrich missing pics/about (registered only)'),
+      ],
+      summary: { inputs: numbers.length, normalized: 0, registered: 0, unregistered: 0, written: 0, enrichUpdated: 0 },
+      error: null,
+    };
+
+    JOBS.set(jobId, job);
+    if (!QUEUES.has(key)) QUEUES.set(key, []);
+    QUEUES.get(key).push(jobId);
+    runQueueForKey({ key, db, sessions }).catch((e) => console.error('[enrich runner] unexpected error:', e));
+
+    res.json({ ok: true, jobId, presentCount: null, absentCount: null });
+  });
+
+  r.get('/contacts/enrich/status', requireUser, async (req, res) => {
+    const accountId = String(req.query.accountId || '');
+    const label = String(req.query.label || '');
+    const jobId = String(req.query.jobId || '');
+    if (!accountId || !label || !jobId) return res.status(400).json({ error: 'accountId, label, jobId required' });
+
+    const allowed = await ensureAllowed(req, res, accountId, label);
+    if (!allowed) return;
+
+    const job = JOBS.get(jobId);
+    if (!job || job.accountId !== accountId || job.label !== label) return res.status(404).json({ error: 'job_not_found' });
 
     res.json({ ok: true, job });
   });
@@ -507,7 +491,7 @@ export function buildContactsRouter({ db, sessions, requireUser, ensureAllowed }
   return r;
 }
 
-// ===== Queue runner (uses Firestore instead of GCS) =====
+// ===== Queue runner =====
 async function runQueueForKey({ key, db, sessions }) {
   if (RUNNING.has(key)) return;
   RUNNING.add(key);
@@ -520,9 +504,16 @@ async function runQueueForKey({ key, db, sessions }) {
 
       job.status = 'running';
       job.startedAt = Date.now();
+      job.lastUpdatedAt = Date.now();
 
       try {
-        await processJob({ job, db, sessions });
+        if (job.kind === 'fullsync') {
+          await processFullSyncJob({ job, db, sessions });
+        } else if (job.kind === 'numbers') {
+          await processNumbersJob({ job, db, sessions });
+        } else {
+          throw new Error(`unknown job kind: ${job.kind}`);
+        }
         job.status = 'done';
         job.finishedAt = Date.now();
       } catch (e) {
@@ -536,112 +527,328 @@ async function runQueueForKey({ key, db, sessions }) {
   }
 }
 
-async function processJob({ job, db, sessions }) {
+// ===== Job processors =====
+async function processFullSyncJob({ job, db, sessions }) {
+  const { accountId, label } = job;
+  const { contacts: contactsCol, chats: chatsCol } = sessRefs(db, accountId, label);
+  const messagesLimit = job.params.messagesLimit;
+
+  // Stage 1: read_contacts
+  stageSet(job, 'read_contacts', { status: 'running', startedAt: Date.now() });
+  const all = await sessions.getContacts({ accountId, label, withDetails: false });
+  const subset = all.filter((c) => c?.type !== 'group' && !!c?.isWAContact && typeof c?.id === 'string' && waIdIsCUs(c.id));
+  const digitsList = subset.map((c) => numberFromContact(c)).filter(Boolean);
+  stageSet(job, 'read_contacts', { status: 'done', finishedAt: Date.now(), total: subset.length, done: subset.length });
+
+  // Stage 2: write_contacts
+  stageSet(job, 'write_contacts', { status: 'running', startedAt: Date.now(), total: subset.length, done: 0 });
+  const docRefs = digitsList.map((d) => contactsCol.doc(docIdForDigits(d)));
+  const existingSnaps = docRefs.length ? await batchedGetAll(db, docRefs, 300) : [];
+  const existingByDigits = new Map();
+  for (let i = 0; i < existingSnaps.length; i++) {
+    const d = digitsList[i];
+    const snap = existingSnaps[i];
+    if (d && snap?.exists) existingByDigits.set(d, snap.data());
+  }
+
+  const ops = [];
+  let appended = 0, updated = 0;
+  for (let i = 0; i < subset.length; i++) {
+    const c = subset[i];
+    const digits = digitsList[i];
+    if (!digits) continue;
+
+    const ref = contactsCol.doc(docIdForDigits(digits));
+    const incoming = {
+      id: c.id,
+      number: digits,
+      name: c?.name || null,
+      pushname: c?.pushname || null,
+      shortName: c?.shortName || null,
+      isWAContact: !!c?.isWAContact,
+      isMyContact: !!c?.isMyContact,
+      isBusiness: !!c?.isBusiness,
+      isEnterprise: !!c?.isEnterprise,
+      hasChat: !!c?.hasChat,
+      registered: true,
+      type: 'private',
+      updatedAt: FieldValue.serverTimestamp(),
+    };
+    const existing = existingByDigits.get(digits);
+    if (!existing) {
+      ops.push({ ref, set: { ...incoming, createdAt: FieldValue.serverTimestamp() } });
+      appended++;
+    } else {
+      const baseDiff = diffFillOnly(existing, incoming);
+      for (const f of ALWAYS_UPDATE_FLAGS) {
+        if (incoming[f] !== undefined && incoming[f] !== existing[f]) baseDiff[f] = incoming[f];
+      }
+      if (Object.keys(baseDiff).length) {
+        ops.push({ ref, update: { ...baseDiff, updatedAt: FieldValue.serverTimestamp() } });
+        updated++;
+      }
+    }
+  }
+  if (ops.length) await batchedSetOrUpdate(db, ops);
+  stageSet(job, 'write_contacts', { status: 'done', finishedAt: Date.now(), done: subset.length });
+  job.summary.contactsAppended = appended;
+  job.summary.contactsUpdated = updated;
+
+  // Stage 3: persist_chats
+  stageSet(job, 'persist_chats', { status: 'running', startedAt: Date.now() });
+  let chatsPersisted = 0, messagesPersisted = 0;
+  const numbersWithChat = subset
+    .filter((c, idx) => c?.hasChat && !!digitsList[idx])
+    .map((_, idx) => digitsList[idx]);
+
+  if (numbersWithChat.length) {
+    const results = await sessions.getChatsByNumbers({
+      accountId,
+      label,
+      numbers: numbersWithChat,
+      countryCode: null,
+      withMessages: true,
+      messagesLimit,
+    });
+
+    const chatOps = [];
+    const msgOps = [];
+    for (const r of results) {
+      if (!r?.exists || !r?.waId || !waIdIsCUs(r.waId)) continue;
+      const digits = normalizeDigits(r.normalized || r.input);
+      if (!digits) continue;
+
+      const chatDocId = docIdForDigits(digits);
+      const cref = chatsCol.doc(chatDocId);
+      const payload = {
+        id: r.chat?.id || r.waId,
+        number: digits,
+        name: r.chat?.name || null,
+        isGroup: !!r.chat?.isGroup,
+        unreadCount: r.chat?.unreadCount ?? null,
+        archived: !!r.chat?.archived,
+        pinned: !!r.chat?.pinned,
+        isReadOnly: !!r.chat?.isReadOnly,
+        updatedAt: FieldValue.serverTimestamp(),
+      };
+      chatOps.push({ ref: cref, set: { ...payload, createdAt: FieldValue.serverTimestamp() } });
+
+      if (Array.isArray(r.messages) && r.messages.length) {
+        const mcol = messagesCol(db, accountId, label, chatDocId);
+        for (const m of r.messages) {
+          if (!m?.id) continue;
+          const mref = mcol.doc(m.id);
+          msgOps.push({
+            ref: mref,
+            set: {
+              id: m.id,
+              chatId: m.chatId || payload.id,
+              fromMe: !!m.fromMe,
+              body: m.body ?? '',
+              type: m.type || null,
+              timestamp: m.timestamp || null,
+              hasMedia: !!m.hasMedia,
+              createdAt: FieldValue.serverTimestamp(),
+              updatedAt: FieldValue.serverTimestamp(),
+            },
+          });
+        }
+      }
+    }
+    if (chatOps.length) { await batchedSetOrUpdate(db, chatOps); chatsPersisted = chatOps.length; }
+    if (msgOps.length)  { await batchedSetOrUpdate(db, msgOps);  messagesPersisted = msgOps.length; }
+  }
+  job.summary.chatsPersisted = chatsPersisted;
+  job.summary.messagesPersisted = messagesPersisted;
+  stageSet(job, 'persist_chats', { status: 'done', finishedAt: Date.now(), total: numbersWithChat.length, done: numbersWithChat.length });
+
+  // Stage 4: enrich_contacts
+  stageSet(job, 'enrich_contacts', { status: 'running', startedAt: Date.now() });
+  let enrichUpdated = 0;
+  if (subset.length) {
+    // choose those missing both fields to minimize calls
+    const refSnaps = docRefs.length ? await batchedGetAll(db, docRefs, 300) : [];
+    const existingMap = new Map();
+    for (let i = 0; i < refSnaps.length; i++) {
+      const d = digitsList[i];
+      const snap = refSnaps[i];
+      if (d && snap?.exists) existingMap.set(d, snap.data());
+    }
+    const needEnrich = subset.filter((c, i) => {
+      const d = digitsList[i];
+      const ex = existingMap.get(d);
+      return ex && (!ex.profilePicUrl && !ex.about);
+    });
+
+    if (needEnrich.length) {
+      const enrichedList = await sessions.enrichContactsSequential({ accountId, label, contacts: needEnrich });
+      const eops = [];
+      for (const c of enrichedList) {
+        const digits = numberFromContact(c);
+        if (!digits || !waIdIsCUs(c?.id)) continue;
+
+        const existing = existingMap.get(digits) || {};
+        const incoming = {
+          profilePicUrl: c?.profilePicUrl ?? null,
+          about: typeof c?.about === 'string' && c.about.length ? c.about : null,
+        };
+        const diff = diffFillOnly(existing, incoming);
+        if (Object.keys(diff).length) {
+          const changed = changedFields(existing, diff);
+          eops.push({
+            ref: contactsCol.doc(docIdForDigits(digits)),
+            update: {
+              ...diff,
+              enrichedAt: FieldValue.serverTimestamp(),
+              ...(changed.length ? { enrichedFields: FieldValue.arrayUnion(...changed) } : {}),
+              updatedAt: FieldValue.serverTimestamp(),
+            },
+          });
+          enrichUpdated++;
+        }
+      }
+      if (eops.length) await batchedSetOrUpdate(db, eops);
+    }
+  }
+  job.summary.enrichUpdated = enrichUpdated;
+  stageSet(job, 'enrich_contacts', { status: 'done', finishedAt: Date.now(), done: enrichUpdated });
+}
+
+async function processNumbersJob({ job, db, sessions }) {
   const { accountId, label } = job;
   const { contacts: contactsCol } = sessRefs(db, accountId, label);
 
-  // Load base list
-  let baseDocs = await contactsCol.get();
-  let baseContacts = baseDocs.docs.map((d) => d.data()).filter((c) => !c?.id || waIdIsCUs(c.id));
+  // Stage 1: normalize_numbers
+  stageSet(job, 'normalize_numbers', { status: 'running', startedAt: Date.now() });
+  const input = Array.isArray(job.params.numbers) ? job.params.numbers : [];
+  const normalized = input.map((x) => normalizeDigits(x)).filter(Boolean);
+  stageSet(job, 'normalize_numbers', { status: 'done', finishedAt: Date.now(), total: input.length, done: normalized.length });
+  job.summary.normalized = normalized.length;
 
-  // Map by digits
-  const byDigits = new Map(baseContacts.map((c) => [numberFromContact(c), c]));
+  // Stage 2: lookup_numbers
+  stageSet(job, 'lookup_numbers', { status: 'running', startedAt: Date.now(), total: normalized.length, done: 0 });
+  // Use batch helper to also grab details when registered
+  const results = await sessions.lookupContactsByNumbers({
+    accountId,
+    label,
+    numbers: normalized,
+    countryCode: null,
+    withDetails: true,
+  });
+  const registeredCount = results.reduce((n, r) => (r?.registered ? n + 1 : n), 0);
+  stageSet(job, 'lookup_numbers', { status: 'done', finishedAt: Date.now(), done: results.length });
+  job.summary.registered = registeredCount;
+  job.summary.unregistered = results.length - registeredCount;
 
-  // ---- Phase A: enrich present contacts (avatar/bio) ----
-  if (job.sets.present.length) {
-    // Build contact stubs with WA id for the enrich helper
-    const presentContacts = job.sets.present
-      .map((n) => byDigits.get(n))
-      .filter(Boolean);
+  // Stage 3: write_numbers (upsert; include unregistered with registered=false)
+  stageSet(job, 'write_numbers', { status: 'running', startedAt: Date.now(), total: results.length, done: 0 });
 
-    // Use existing sequential helper (keeps structure); internal jitter is modest.
-    const enrichedList = await sessions.enrichContactsSequential({
-      accountId,
-      label,
-      contacts: presentContacts,
-    });
+  // Preload existing docs
+  const docRefs = normalized.map((d) => contactsCol.doc(docIdForDigits(d)));
+  const existingSnaps = docRefs.length ? await batchedGetAll(db, docRefs, 300) : [];
+  const existingByDigits = new Map();
+  for (let i = 0; i < existingSnaps.length; i++) {
+    const d = normalized[i];
+    const snap = existingSnaps[i];
+    if (d && snap?.exists) existingByDigits.set(d, snap.data());
+  }
 
-    // Write selective updates to Firestore
-    const ops = [];
-    for (const c of enrichedList) {
+  const ops = [];
+  let written = 0;
+  for (const r of results) {
+    const digits = normalizeDigits(r.normalized || r.input);
+    if (!digits) continue;
+
+    const existing = existingByDigits.get(digits);
+    const ref = contactsCol.doc(docIdForDigits(digits));
+
+    const payload = {
+      id: (r.waId && waIdIsCUs(r.waId)) ? r.waId : null,
+      number: digits,
+      name: r.contact?.name || null,
+      pushname: r.contact?.pushname || null,
+      shortName: r.contact?.shortName || null,
+      isWAContact: !!r.registered,
+      isMyContact: !!r.contact?.isMyContact,
+      isBusiness: !!r.contact?.isBusiness,
+      isEnterprise: !!r.contact?.isEnterprise,
+      hasChat: !!r.hasChat,
+      registered: !!r.registered,
+      type: 'private',
+      // details when available
+      profilePicUrl: r.contact?.profilePicUrl || null,
+      about: r.contact?.about || null,
+      updatedAt: FieldValue.serverTimestamp(),
+    };
+
+    if (!existing) {
+      ops.push({ ref, set: { ...payload, createdAt: FieldValue.serverTimestamp() } });
+      written++;
+    } else {
+      // fill-only for details, but always refresh flags (registered, isWAContact, hasChat, isMyContact)
+      const baseDiff = diffFillOnly(existing, payload);
+      for (const f of ALWAYS_UPDATE_FLAGS) {
+        if (payload[f] !== undefined && payload[f] !== existing[f]) baseDiff[f] = payload[f];
+      }
+      // Keep id if new valid one appears
+      if (payload.id && payload.id !== existing.id) baseDiff.id = payload.id;
+      if (Object.keys(baseDiff).length) {
+        ops.push({ ref, update: { ...baseDiff, updatedAt: FieldValue.serverTimestamp() } });
+        written++;
+      }
+    }
+  }
+  if (ops.length) await batchedSetOrUpdate(db, ops);
+  stageSet(job, 'write_numbers', { status: 'done', finishedAt: Date.now(), done: results.length });
+  job.summary.written = written;
+
+  // Stage 4: enrich_missing (registered only, and only if both fields missing)
+  stageSet(job, 'enrich_missing', { status: 'running', startedAt: Date.now() });
+  // Determine who needs enrichment
+  const refSnaps = docRefs.length ? await batchedGetAll(db, docRefs, 300) : [];
+  const need = [];
+  const mapByDigits = new Map();
+  for (let i = 0; i < refSnaps.length; i++) {
+    const d = normalized[i];
+    const snap = refSnaps[i];
+    const ex = snap?.exists ? snap.data() : null;
+    if (!ex) continue;
+    mapByDigits.set(d, ex);
+    if (ex.registered && !ex.profilePicUrl && !ex.about && ex.id && waIdIsCUs(ex.id)) {
+      need.push({ id: ex.id, number: ex.number, type: 'private' });
+    }
+  }
+
+  let enrichUpdated = 0;
+  if (need.length) {
+    const enriched = await sessions.enrichContactsSequential({ accountId, label, contacts: need });
+    const eops = [];
+    for (const c of enriched) {
       const digits = numberFromContact(c);
       if (!digits || !waIdIsCUs(c?.id)) continue;
 
-      const ref = contactsCol.doc(docIdForDigits(digits));
-      const existing = byDigits.get(digits) || {};
-
+      const existing = mapByDigits.get(digits) || {};
       const incoming = {
         profilePicUrl: c?.profilePicUrl ?? null,
         about: typeof c?.about === 'string' && c.about.length ? c.about : null,
       };
-
       const diff = diffFillOnly(existing, incoming);
-      const changed = changedFields(existing, diff);
-      if (changed.length) {
-        ops.push({
-          ref,
+      if (Object.keys(diff).length) {
+        const changed = changedFields(existing, diff);
+        eops.push({
+          ref: contactsCol.doc(docIdForDigits(digits)),
           update: {
             ...diff,
             enrichedAt: FieldValue.serverTimestamp(),
-            enrichedFields: FieldValue.arrayUnion(...changed),
+            ...(changed.length ? { enrichedFields: FieldValue.arrayUnion(...changed) } : {}),
             updatedAt: FieldValue.serverTimestamp(),
           },
         });
-        // update local mirror for subsequent diffs
-        byDigits.set(digits, { ...existing, ...diff });
+        enrichUpdated++;
       }
     }
-    if (ops.length) await batchedSetOrUpdate(db, ops);
-
-    job.progress.presentDone = job.progress.presentTotal;
+    if (eops.length) await batchedSetOrUpdate(db, eops);
   }
-
-  // ---- Phase B: check absent numbers (registration + details) ----
-  const opsAbsent = [];
-  for (const n of job.sets.absent) {
-    // Very small jitter (fast mode)
-    await sleep(rand(8, 25));
-
-    const result = await sessions.checkContactByNumber({
-      accountId,
-      label,
-      number: n,
-      countryCode: null,
-      withDetails: true,
-    });
-
-    if (result?.registered && result?.waId && waIdIsCUs(result.waId)) {
-      const digits = normalizeDigits(result.normalized || n);
-      if (!digits) {
-        job.progress.absentDone += 1;
-        continue;
-      }
-
-      const ref = contactsCol.doc(docIdForDigits(digits));
-      const payload = {
-        id: result.waId,
-        number: digits,
-        name: result.contact?.name || null,
-        pushname: result.contact?.pushname || null,
-        shortName: result.contact?.shortName || null,
-        isWAContact: true,
-        isMyContact: !!result.contact?.isMyContact,
-        isBusiness: !!result.contact?.isBusiness,
-        isEnterprise: !!result.contact?.isEnterprise,
-        hasChat: !!result.hasChat,
-        type: 'private',
-        profilePicUrl: result.contact?.profilePicUrl || null,
-        about: result.contact?.about || null,
-        createdAt: FieldValue.serverTimestamp(),
-        updatedAt: FieldValue.serverTimestamp(),
-        enrichedAt: FieldValue.serverTimestamp(),
-        enrichedFields: ['profilePicUrl', 'about'],
-      };
-      opsAbsent.push({ ref, set: payload });
-      byDigits.set(digits, payload); // keep mirror coherent
-    }
-
-    job.progress.absentDone += 1;
-  }
-  if (opsAbsent.length) await batchedSetOrUpdate(db, opsAbsent);
+  job.summary.enrichUpdated = enrichUpdated;
+  stageSet(job, 'enrich_missing', { status: 'done', finishedAt: Date.now(), done: enrichUpdated });
 }
