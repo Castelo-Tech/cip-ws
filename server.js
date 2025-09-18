@@ -121,7 +121,7 @@ app.use(buildAclRouter({ rbac, requireUser }));
 app.use(buildMessagesRouter({ sessions, requireUser, ensureAllowed }));
 app.use(buildMediaRouter({ sessions, requireUser, ensureAllowed }));
 
-// ⬇️ pass the bucket into contacts router
+// ⬇️ pass the bucket into contacts router (now includes async enrich job endpoints)
 app.use(buildContactsRouter({ sessions, requireUser, ensureAllowed, bucket }));
 
 app.use(buildChatsRouter({ sessions, requireUser, ensureAllowed }));

@@ -1,10 +1,7 @@
 // routes/contacts.js
 import { Router } from 'express';
 
-/**
- * Ensure a "directory" prefix exists in GCS by creating a zero-byte marker object.
- * GCS is flat; folders are just prefixes. This is purely for convenience.
- */
+// ===== GCS helpers =====
 async function ensurePrefix(bucket, prefix) {
   const clean = String(prefix).replace(/\/+$/, '') + '/';
   const [files] = await bucket.getFiles({ prefix: clean, maxResults: 1 });
@@ -41,6 +38,7 @@ async function readJsonIfExists(file) {
   }
 }
 
+// ===== Merge helpers =====
 // Upsert merge: add new contacts; update missing fields on existing ones.
 // Returns { merged, appended, updated }.
 function upsertMerge(existingArr = [], incomingArr = []) {
@@ -65,8 +63,7 @@ function upsertMerge(existingArr = [], incomingArr = []) {
       continue;
     }
 
-    // Shallow "fill in" merge: only set fields that are currently null/undefined/empty.
-    // Prefer incoming values for profilePicUrl/about if existing is falsy.
+    // Fill-only update (don’t clobber non-empty existing fields).
     const cur = map.get(k);
     let changed = false;
 
@@ -124,14 +121,48 @@ function buildStats(list = []) {
   return { total, byType, flags, details, fields };
 }
 
+// ===== Number normalization helpers =====
+function normalizeDigits(s) {
+  return String(s || '').replace(/[^\d]/g, '');
+}
+function numberFromContact(c) {
+  if (c?.number) return normalizeDigits(c.number);
+  const id = String(c?.id || '');
+  if (id.endsWith('@c.us')) return normalizeDigits(id.split('@')[0]);
+  return '';
+}
+
+// ===== In-memory job management =====
+const JOBS = new Map(); // jobId -> job object
+const QUEUES = new Map(); // key accountId::label -> [jobId]
+const RUNNING = new Set(); // keys currently running
+
+function queueKey({ accountId, label }) {
+  return `${accountId}::${label}`;
+}
+function makeJobId() {
+  return `job_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+}
+
+async function saveJson(file, obj) {
+  await file.save(JSON.stringify(obj, null, 2), {
+    resumable: false,
+    contentType: 'application/json',
+    metadata: { cacheControl: 'no-cache' },
+  });
+}
+
 export function buildContactsRouter({ sessions, requireUser, ensureAllowed, bucket }) {
   const r = Router();
 
-  // Narrowed contacts + per-session persistence + sequential enrichment
+  // ---------- /contacts (simplified) ----------
+  // - Fetch contacts from the session (no enrichment here)
+  // - Filter to: type=private && isMyContact && isWAContact
+  // - Upsert-merge into contacts.json (per-session path)
+  // - Return only the filtered subset + stats
   r.get('/contacts', requireUser, async (req, res) => {
     const accountId = String(req.query.accountId || '');
     const label = String(req.query.label || '');
-    // We ignore ?details for the base fetch: we will enrich the filtered subset regardless.
 
     if (!accountId || !label) return res.status(400).json({ error: 'accountId, label required' });
 
@@ -142,133 +173,62 @@ export function buildContactsRouter({ sessions, requireUser, ensureAllowed, buck
     if (st !== 'ready') return res.status(409).json({ error: 'session not ready', status: st || null });
 
     try {
-      // 1) Fetch baseline (no details here; we will enrich subset sequentially)
       const all = await sessions.getContacts({ accountId, label, withDetails: false });
+      const subset = all.filter((c) => c?.type === 'private' && !!c?.isMyContact && !!c?.isWAContact);
 
-      // 2) Filter down to the required subset
-      const subset = all.filter(
-        (c) => c?.type === 'private' && !!c?.isMyContact && !!c?.isWAContact
-      );
-
-      // --- Prepare storage path ---
       let storageInfo = {
         ok: false,
         bucket: bucket?.name || null,
         object: null,
         mode: null,
         error: null,
-        phase1: { appended: 0, updated: 0, totalStored: null },
-        phase2: { appended: 0, updated: 0, totalStored: null },
+        totalStored: null,
       };
-
-      let objectName = null;
-      let file = null;
-      let existingContacts = [];
-      let mergedAfterPhase1 = [];
 
       if (bucket) {
         try {
           await ensurePrefix(bucket, `${accountId}`);
           await ensurePrefix(bucket, `${accountId}/whatsapp`);
           const sessPrefix = await ensurePrefix(bucket, `${accountId}/whatsapp/${label}`);
-          objectName = `${sessPrefix}contacts.json`;
-          file = bucket.file(objectName);
+          const objectName = `${sessPrefix}contacts.json`;
+          const file = bucket.file(objectName);
 
           const existing = (await fileExists(file)) ? await readJsonIfExists(file) : null;
-          existingContacts = Array.isArray(existing?.contacts) ? existing.contacts : [];
+          const existingContacts = Array.isArray(existing?.contacts) ? existing.contacts : [];
+          const { merged } = upsertMerge(existingContacts, subset);
 
-          storageInfo.mode = existing ? 'merge' : 'create';
-
-          // 3) PHASE 1 — quick write of the filtered subset (upsert)
-          {
-            const { merged, appended, updated } = upsertMerge(existingContacts, subset);
-            mergedAfterPhase1 = merged;
-
-            const payload1 = {
-              accountId,
-              label,
-              generatedAt: new Date().toISOString(),
-              count: merged.length,
-              contacts: merged,
-              _meta: {
-                phase: 1,
-                previousCount: existingContacts.length || 0,
-                filter: { type: 'private', isMyContact: true, isWAContact: true },
-              },
-            };
-
-            await file.save(JSON.stringify(payload1, null, 2), {
-              resumable: false,
-              contentType: 'application/json',
-              metadata: {
-                cacheControl: 'no-cache',
-                metadata: { accountId, label, source: 'contacts_endpoint' },
-              },
-            });
-
-            storageInfo.phase1 = { appended, updated, totalStored: merged.length };
-            storageInfo.ok = true;
-            storageInfo.bucket = bucket.name;
-            storageInfo.object = objectName;
-          }
-
-          // 4) PHASE 2 — sequential enrichment (avatar + bio) over the subset, then upsert again
-          const enriched = await sessions.enrichContactsSequential({
-            accountId, label, contacts: subset
-          });
-
-          const { merged, appended, updated } = upsertMerge(mergedAfterPhase1, enriched);
-
-          const payload2 = {
+          const payload = {
             accountId,
             label,
             generatedAt: new Date().toISOString(),
             count: merged.length,
             contacts: merged,
             _meta: {
-              phase: 2,
-              previousCount: mergedAfterPhase1.length,
               filter: { type: 'private', isMyContact: true, isWAContact: true },
-              enrichment: { mode: 'sequential', jitter: { perItemMs: [45,110], everyN: 25, pauseMs: [200,450] } },
             },
           };
 
-          await file.save(JSON.stringify(payload2, null, 2), {
-            resumable: false,
-            contentType: 'application/json',
-            metadata: {
-              cacheControl: 'no-cache',
-              metadata: { accountId, label, source: 'contacts_endpoint' },
-            },
-          });
+          await saveJson(file, payload);
 
-          storageInfo.phase2 = { appended, updated, totalStored: merged.length };
+          storageInfo = {
+            ok: true,
+            bucket: bucket.name,
+            object: objectName,
+            mode: existing ? 'merge' : 'create',
+            error: null,
+            totalStored: merged.length,
+          };
         } catch (e) {
-          storageInfo.ok = false;
           storageInfo.error = String(e?.message || e);
-          // We still return the enriched subset below even if storage fails.
-          console.error('[contacts] storage write failed:', e);
+          console.error('[contacts] write failed:', e);
         }
       }
 
-      // 5) Always return ONLY the filtered subset; return the enriched form
-      let subsetForResponse = [];
-      try {
-        subsetForResponse = await sessions.enrichContactsSequential({
-          accountId, label, contacts: subset
-        });
-      } catch {
-        // Best effort; fall back to base subset if enrich failed
-        subsetForResponse = subset;
-      }
-
-      const stats = buildStats(subsetForResponse);
-
       res.json({
         ok: true,
-        count: subsetForResponse.length,
-        contacts: subsetForResponse,   // ONLY the filtered (and enriched) subset
-        stats,                         // stats for the returned subset
+        count: subset.length,
+        contacts: subset,
+        stats: buildStats(subset),
         storage: storageInfo,
       });
     } catch (e) {
@@ -276,9 +236,20 @@ export function buildContactsRouter({ sessions, requireUser, ensureAllowed, buck
     }
   });
 
-  // Bulk lookup (unchanged)
-  r.post('/contacts/lookup', requireUser, async (req, res) => {
-    const { accountId, label, numbers, countryCode, withDetails = true } = req.body || {};
+  // ---------- NEW: async enrichment job ----------
+  // POST /contacts/enrich/start
+  // body: { accountId, label, numbers: string[] }
+  //
+  // Steps:
+  // 1) Read per-session contacts.json as base.
+  // 2) Split input numbers into "present in contacts.json" vs "absent".
+  // 3) Enqueue a job:
+  //    - present: enrich avatar/bio (sequential, moderate jitter)
+  //    - absent: check registration (sequential), include registered with details
+  // 4) Write/merge into enriched_contacts.json (copy/superset of contacts.json)
+  // 5) Return { jobId } immediately; poll status with GET /contacts/enrich/status
+  r.post('/contacts/enrich/start', requireUser, async (req, res) => {
+    const { accountId, label, numbers } = req.body || {};
     if (!accountId || !label || !Array.isArray(numbers) || numbers.length === 0) {
       return res.status(400).json({ error: 'accountId, label, numbers[] required' });
     }
@@ -290,43 +261,232 @@ export function buildContactsRouter({ sessions, requireUser, ensureAllowed, buck
     if (st !== 'ready') return res.status(409).json({ error: 'session not ready', status: st || null });
 
     try {
-      const out = await sessions.lookupContactsByNumbers({
+      // Prepare storage paths
+      await ensurePrefix(bucket, `${accountId}`);
+      await ensurePrefix(bucket, `${accountId}/whatsapp`);
+      const sessPrefix = await ensurePrefix(bucket, `${accountId}/whatsapp/${label}`);
+
+      const contactsFile = bucket.file(`${sessPrefix}contacts.json`);
+      const enrichedFile = bucket.file(`${sessPrefix}enriched_contacts.json`);
+
+      const base = (await fileExists(contactsFile)) ? await readJsonIfExists(contactsFile) : { contacts: [] };
+      const baseContacts = Array.isArray(base?.contacts) ? base.contacts : [];
+
+      // Ensure enriched file exists as a copy (if missing)
+      if (!(await fileExists(enrichedFile))) {
+        const payload = {
+          accountId,
+          label,
+          generatedAt: new Date().toISOString(),
+          count: baseContacts.length,
+          contacts: baseContacts,
+          _meta: { source: 'bootstrap_from_contacts_json' },
+        };
+        await saveJson(enrichedFile, payload);
+      }
+
+      // Build “present” vs “absent” sets by normalized number
+      const presentNumbersSet = new Set(baseContacts.map((c) => numberFromContact(c)).filter(Boolean));
+      const inNumbers = numbers.map((x) => normalizeDigits(x)).filter(Boolean);
+
+      const present = [];
+      const absent = [];
+      for (const n of inNumbers) {
+        if (presentNumbersSet.has(n)) present.push(n);
+        else absent.push(n);
+      }
+
+      // Create the job
+      const jobId = makeJobId();
+      const key = queueKey({ accountId, label });
+      const job = {
+        id: jobId,
         accountId,
         label,
-        numbers,
-        countryCode: countryCode || null,
-        withDetails: !!withDetails,
+        status: 'queued', // 'queued' | 'running' | 'done' | 'error'
+        createdAt: Date.now(),
+        startedAt: null,
+        finishedAt: null,
+        input: { total: inNumbers.length, numbers: inNumbers },
+        sets: { present, absent },
+        progress: {
+          presentTotal: present.length, presentDone: 0,
+          absentTotal: absent.length, absentDone: 0,
+        },
+        storage: {
+          bucket: bucket.name,
+          enrichedObject: `${sessPrefix}enriched_contacts.json`,
+        },
+        error: null,
+      };
+
+      JOBS.set(jobId, job);
+      if (!QUEUES.has(key)) QUEUES.set(key, []);
+      QUEUES.get(key).push(jobId);
+
+      // Kick the runner
+      runQueueForKey({ key, sessions, bucket }).catch((e) => {
+        console.error('[enrich runner] unexpected error:', e);
       });
-      res.json({ ok: true, results: out });
+
+      res.json({
+        ok: true,
+        jobId,
+        presentCount: present.length,
+        absentCount: absent.length,
+      });
     } catch (e) {
-      res.status(500).json({ error: 'lookup_failed', detail: String(e?.message || e) });
+      res.status(500).json({ error: 'enrich_start_failed', detail: String(e?.message || e) });
     }
   });
 
-  // Single-number check (unchanged)
-  r.get('/contacts/check', requireUser, async (req, res) => {
+  // GET /contacts/enrich/status?accountId=...&label=...&jobId=...
+  r.get('/contacts/enrich/status', requireUser, async (req, res) => {
     const accountId = String(req.query.accountId || '');
     const label = String(req.query.label || '');
-    const number = String(req.query.number || '');
-    const countryCode = req.query.countryCode ? String(req.query.countryCode) : null;
-    const withDetails = String(req.query.details || 'false') === 'true';
+    const jobId = String(req.query.jobId || '');
 
-    if (!accountId || !label || !number) {
-      return res.status(400).json({ error: 'accountId, label, number required' });
+    if (!accountId || !label || !jobId) {
+      return res.status(400).json({ error: 'accountId, label, jobId required' });
     }
     const allowed = await ensureAllowed(req, res, accountId, label);
     if (!allowed) return;
 
-    const st = sessions.status({ accountId, label });
-    if (st !== 'ready') return res.status(409).json({ error: 'session not ready', status: st || null });
-
-    try {
-      const out = await sessions.checkContactByNumber({ accountId, label, number, countryCode, withDetails });
-      res.json({ ok: true, ...out });
-    } catch (e) {
-      res.status(500).json({ error: 'check_failed', detail: String(e?.message || e) });
+    const job = JOBS.get(jobId);
+    if (!job || job.accountId !== accountId || job.label !== label) {
+      return res.status(404).json({ error: 'job_not_found' });
     }
+
+    res.json({ ok: true, job });
   });
 
   return r;
+}
+
+// ===== Runner implementation (sequential processing with light jitter) =====
+async function runQueueForKey({ key, sessions, bucket }) {
+  if (RUNNING.has(key)) return; // already running
+  RUNNING.add(key);
+
+  try {
+    const q = QUEUES.get(key) || [];
+    while (q.length) {
+      const jobId = q.shift();
+      const job = JOBS.get(jobId);
+      if (!job) continue;
+
+      job.status = 'running';
+      job.startedAt = Date.now();
+
+      try {
+        await processJob({ job, sessions, bucket });
+        job.status = 'done';
+        job.finishedAt = Date.now();
+      } catch (e) {
+        job.status = 'error';
+        job.error = String(e?.message || e);
+        job.finishedAt = Date.now();
+      }
+    }
+  } finally {
+    RUNNING.delete(key);
+  }
+}
+
+async function processJob({ job, sessions, bucket }) {
+  const { accountId, label } = job;
+
+  // Prepare storage paths
+  const sessPrefix = `${accountId}/whatsapp/${label}/`;
+  const enrichedFile = bucket.file(`${sessPrefix}enriched_contacts.json`);
+  const contactsFile = bucket.file(`${sessPrefix}contacts.json`);
+
+  // Load base enriched (or bootstrap from contacts)
+  let enriched = (await fileExists(enrichedFile)) ? await readJsonIfExists(enrichedFile) : null;
+  if (!enriched) {
+    const base = (await fileExists(contactsFile)) ? await readJsonIfExists(contactsFile) : { contacts: [] };
+    enriched = {
+      accountId,
+      label,
+      generatedAt: new Date().toISOString(),
+      count: Array.isArray(base.contacts) ? base.contacts.length : 0,
+      contacts: Array.isArray(base.contacts) ? base.contacts : [],
+      _meta: { source: 'bootstrap_at_job_runtime' },
+    };
+    await saveJson(enrichedFile, enriched);
+  }
+  const baseContacts = Array.isArray(enriched.contacts) ? enriched.contacts : [];
+
+  // Build lookup maps for present contacts
+  const byNumber = new Map(baseContacts.map((c) => [numberFromContact(c), c]));
+
+  // ---- Phase A: enrich present contacts (avatar/bio) ----
+  if (job.sets.present.length) {
+    // Gather contacts for present numbers
+    const presentContacts = job.sets.present
+      .map((n) => byNumber.get(n))
+      .filter(Boolean);
+
+    // Use the session’s sequential enrichment helper
+    const enrichedList = await sessions.enrichContactsSequential({
+      accountId,
+      label,
+      contacts: presentContacts,
+    });
+
+    // Merge and update progress (as one step)
+    const { merged } = upsertMerge(baseContacts, enrichedList);
+    enriched.contacts = merged;
+    enriched.count = merged.length;
+    enriched.generatedAt = new Date().toISOString();
+    await saveJson(enrichedFile, enriched);
+
+    job.progress.presentDone = job.progress.presentTotal; // batch done
+  }
+
+  // ---- Phase B: check absent numbers (registration + details) ----
+  for (const n of job.sets.absent) {
+    // Moderate jitter between checks to be nice
+    await sleep(rand(60, 140));
+
+    // We use single-number check to update progress per item
+    const result = await sessions.checkContactByNumber({
+      accountId,
+      label,
+      number: n,
+      countryCode: null,
+      withDetails: true,
+    });
+
+    if (result?.registered && result?.waId) {
+      // Map to our contact shape (private)
+      const contact = {
+        id: result.waId,
+        number: result.normalized || n,
+        name: result.contact?.name || null,
+        pushname: result.contact?.pushname || null,
+        shortName: result.contact?.shortName || null,
+        isWAContact: true,
+        isMyContact: !!result.contact?.isMyContact, // likely false for non-contacts
+        isBusiness: !!result.contact?.isBusiness,
+        isEnterprise: !!result.contact?.isEnterprise,
+        hasChat: !!result.hasChat,
+        type: 'private',
+        profilePicUrl: result.contact?.profilePicUrl || null,
+        about: result.contact?.about || null,
+      };
+
+      const { merged } = upsertMerge(enriched.contacts, [contact]);
+      enriched.contacts = merged;
+      enriched.count = merged.length;
+      enriched.generatedAt = new Date().toISOString();
+      await saveJson(enrichedFile, enriched);
+    }
+
+    job.progress.absentDone += 1;
+  }
+
+  // Final save (idempotent)
+  enriched.generatedAt = new Date().toISOString();
+  await saveJson(enrichedFile, enriched);
 }
