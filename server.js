@@ -12,9 +12,6 @@ import { initializeApp, applicationDefault } from 'firebase-admin/app';
 import { getAuth } from 'firebase-admin/auth';
 import { getFirestore } from 'firebase-admin/firestore';
 
-// ---------- gcs (for Firebase Storage bucket) ----------
-import { Storage } from '@google-cloud/storage';
-
 // ---------- local modules (untouched) ----------
 import { createMetadata } from './lib/metadata.js';
 import { createRbac } from './lib/rbac.js';
@@ -39,14 +36,6 @@ initializeApp({ credential: applicationDefault() });
 const db = getFirestore();
 const authAdmin = getAuth();
 
-// ---------- Google Cloud Storage (ADC) ----------
-/**
- * NOTE: The bucket name *looks* like a domain, but it's the canonical bucket name.
- * We use the GCS client directly (works fine for Firebase Storage buckets).
- */
-const BUCKET_NAME = 'castelo-insure-platform.firebasestorage.app';
-const storage = new Storage(); // uses ADC on your VM
-const bucket = storage.bucket(BUCKET_NAME);
 
 // ---------- Express ----------
 const app = express();
@@ -121,8 +110,9 @@ app.use(buildAclRouter({ rbac, requireUser }));
 app.use(buildMessagesRouter({ sessions, requireUser, ensureAllowed }));
 app.use(buildMediaRouter({ sessions, requireUser, ensureAllowed }));
 
-// ⬇️ pass the bucket into contacts router (now includes async enrich job endpoints)
-app.use(buildContactsRouter({ sessions, requireUser, ensureAllowed, bucket }));
+// ⬇️ pass Firestore into contacts router (now persists to /accounts/{aid}/sessions/{label}/...)
+app.use(buildContactsRouter({ db, sessions, requireUser, ensureAllowed }));
+
 
 app.use(buildChatsRouter({ sessions, requireUser, ensureAllowed }));
 

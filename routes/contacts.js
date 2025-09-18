@@ -1,47 +1,38 @@
 // routes/contacts.js
 import { Router } from 'express';
-import { sleep, rand, normalizeChatId } from '../lib/session/utils.js';
+import {
+  FieldValue,
+} from 'firebase-admin/firestore';
+import { sleep, rand } from '../lib/session/utils.js';
 
-// ===== GCS helpers =====
-async function ensurePrefix(bucket, prefix) {
-  const clean = String(prefix).replace(/\/+$/, '') + '/';
-  const [files] = await bucket.getFiles({ prefix: clean, maxResults: 1 });
-  if (files && files.length > 0) return clean;
-
-  try {
-    await bucket.file(clean).save('', {
-      resumable: false,
-      metadata: { contentType: 'application/x-directory' },
-    });
-  } catch {
-    // non-fatal; subsequent writes still create the prefix implicitly
-  }
-  return clean;
+// ===== Path + id helpers (session-scoped Firestore structure) =====
+function sessRefs(db, accountId, label) {
+  const base = db.collection('accounts').doc(accountId).collection('sessions').doc(label);
+  return {
+    base,
+    contacts: base.collection('contacts'),
+    chats: base.collection('chats'),
+  };
 }
 
-async function fileExists(file) {
-  try {
-    const [exists] = await file.exists();
-    return !!exists;
-  } catch {
-    return false;
-  }
+// ===== Normalization helpers =====
+function normalizeDigits(s) {
+  return String(s || '').replace(/[^\d]/g, '');
+}
+function numberFromContact(c) {
+  if (c?.number) return normalizeDigits(c.number);
+  const id = String(c?.id || '');
+  if (id.endsWith('@c.us')) return normalizeDigits(id.split('@')[0]);
+  return '';
+}
+function docIdForDigits(digits) {
+  return normalizeDigits(digits); // contact docId = numeric phone
+}
+function waIdIsCUs(id) {
+  return typeof id === 'string' && id.endsWith('@c.us');
 }
 
-async function readJsonIfExists(file) {
-  try {
-    const [buf] = await file.download();
-    const text = buf?.toString('utf8') || '';
-    if (!text.trim()) return null;
-    return JSON.parse(text);
-  } catch {
-    return null;
-  }
-}
-
-// ===== Merge helpers =====
-// Upsert merge: add new contacts; update missing fields on existing ones.
-// Returns { merged, appended, updated }.
+// ===== Merge helpers (fill-only upsert; returns {merged, appended, updated}) =====
 function upsertMerge(existingArr = [], incomingArr = []) {
   const keyOf = (c) => (c?.id && String(c.id)) || (c?.number && String(c.number)) || null;
 
@@ -64,7 +55,6 @@ function upsertMerge(existingArr = [], incomingArr = []) {
       continue;
     }
 
-    // Fill-only update (don’t clobber non-empty existing fields).
     const cur = map.get(k);
     let changed = false;
 
@@ -86,8 +76,7 @@ function upsertMerge(existingArr = [], incomingArr = []) {
     }
   }
 
-  const merged = Array.from(map.values());
-  merged.sort((a, b) => {
+  const merged = Array.from(map.values()).sort((a, b) => {
     const ka = String(a.number || a.id || '');
     const kb = String(b.number || b.id || '');
     return ka.localeCompare(kb);
@@ -122,18 +111,45 @@ function buildStats(list = []) {
   return { total, byType, flags, details, fields };
 }
 
-// ===== Number normalization helpers =====
-function normalizeDigits(s) {
-  return String(s || '').replace(/[^\d]/g, '');
-}
-function numberFromContact(c) {
-  if (c?.number) return normalizeDigits(c.number);
-  const id = String(c?.id || '');
-  if (id.endsWith('@c.us')) return normalizeDigits(id.split('@')[0]);
-  return '';
+// ===== Firestore upsert utils =====
+function diffFillOnly(existing, incoming) {
+  // Only include fields where existing is empty/undefined/null OR "profilePicUrl/about" when currently empty.
+  const out = {};
+  for (const [k, v] of Object.entries(incoming)) {
+    const cur = existing?.[k];
+    const wantOverwrite =
+      (cur === null || cur === undefined || cur === '') ||
+      ((k === 'profilePicUrl' || k === 'about') && !cur && !!v);
+    if (wantOverwrite && v !== undefined) out[k] = v;
+  }
+  return out;
 }
 
-// ===== In-memory job management =====
+function changedFields(existing, updates) {
+  const changed = [];
+  for (const [k, v] of Object.entries(updates)) {
+    const cur = existing?.[k];
+    if (v !== undefined && v !== cur) changed.push(k);
+  }
+  return changed;
+}
+
+async function batchedSetOrUpdate(db, ops) {
+  // ops: array of {ref, set?:object, update?:object}
+  // Firestore batch limit = 500 writes; chunk to ~450
+  const CHUNK = 450;
+  for (let i = 0; i < ops.length; i += CHUNK) {
+    const batch = db.batch();
+    const slice = ops.slice(i, i + CHUNK);
+    for (const op of slice) {
+      if (op.set) batch.set(op.ref, op.set, { merge: true });
+      if (op.update && Object.keys(op.update).length) batch.set(op.ref, op.update, { merge: true });
+    }
+    await batch.commit();
+  }
+}
+
+// ===== In-memory job management (unchanged API) =====
 const JOBS = new Map(); // jobId -> job object
 const QUEUES = new Map(); // key accountId::label -> [jobId]
 const RUNNING = new Set(); // keys currently running
@@ -145,25 +161,19 @@ function makeJobId() {
   return `job_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 }
 
-async function saveJson(file, obj) {
-  await file.save(JSON.stringify(obj, null, 2), {
-    resumable: false,
-    contentType: 'application/json',
-    metadata: { cacheControl: 'no-cache' },
-  });
-}
-
-export function buildContactsRouter({ sessions, requireUser, ensureAllowed, bucket }) {
+// ===== Router =====
+export function buildContactsRouter({ db, sessions, requireUser, ensureAllowed }) {
   const r = Router();
 
-  // ---------- /contacts (simplified) ----------
-  // - Fetch contacts from the session (no enrichment here)
-  // - Filter to: type=private && isMyContact && isWAContact
-  // - Upsert-merge into contacts.json (per-session path)
-  // - Return only the filtered subset + stats
+  // ---------- GET /contacts ----------
+  // - Pull live contacts from WA (no enrichment here).
+  // - Filter to private + isMyContact + isWAContact + @c.us
+  // - Upsert into Firestore under /accounts/{aid}/sessions/{label}/contacts/{digits}
+  // - Optionally also persist chats for those contacts with hasChat (?includeChats=1)
   r.get('/contacts', requireUser, async (req, res) => {
     const accountId = String(req.query.accountId || '');
     const label = String(req.query.label || '');
+    const includeChats = String(req.query.includeChats || '') === '1';
 
     if (!accountId || !label) return res.status(400).json({ error: 'accountId, label required' });
 
@@ -182,54 +192,116 @@ export function buildContactsRouter({ sessions, requireUser, ensureAllowed, buck
           !!c?.isMyContact &&
           !!c?.isWAContact &&
           typeof c?.id === 'string' &&
-          c.id.endsWith('@c.us')
+          waIdIsCUs(c.id)
       );
 
-      let storageInfo = {
-        ok: false,
-        bucket: bucket?.name || null,
-        object: null,
-        mode: null,
-        error: null,
-        totalStored: null,
-      };
+      // Prepare existing docs map (by digits)
+      const { contacts: contactsCol, chats: chatsCol } = sessRefs(db, accountId, label);
 
-      if (bucket) {
-        try {
-          await ensurePrefix(bucket, `${accountId}`);
-          await ensurePrefix(bucket, `${accountId}/whatsapp`);
-          const sessPrefix = await ensurePrefix(bucket, `${accountId}/whatsapp/${label}`);
-          const objectName = `${sessPrefix}contacts.json`;
-          const file = bucket.file(objectName);
+      const digitsList = subset.map((c) => numberFromContact(c)).filter(Boolean);
+      const docRefs = digitsList.map((d) => contactsCol.doc(docIdForDigits(d)));
+      const existingSnaps = docRefs.length ? await db.getAll(...docRefs) : [];
+      const existingByDigits = new Map();
+      for (let i = 0; i < existingSnaps.length; i++) {
+        const d = digitsList[i];
+        const snap = existingSnaps[i];
+        if (d && snap?.exists) existingByDigits.set(d, snap.data());
+      }
 
-          const existing = (await fileExists(file)) ? await readJsonIfExists(file) : null;
-          const existingContacts = Array.isArray(existing?.contacts) ? existing.contacts : [];
-          const { merged } = upsertMerge(existingContacts, subset);
+      // Build upserts
+      const ops = [];
+      let appended = 0;
+      let updated = 0;
 
-          const payload = {
+      for (let i = 0; i < subset.length; i++) {
+        const c = subset[i];
+        const digits = digitsList[i];
+        if (!digits) continue;
+
+        const ref = contactsCol.doc(docIdForDigits(digits));
+        const incoming = {
+          id: c.id,
+          number: digits,
+          name: c?.name || null,
+          pushname: c?.pushname || null,
+          shortName: c?.shortName || null,
+          isWAContact: !!c?.isWAContact,
+          isMyContact: !!c?.isMyContact,
+          isBusiness: !!c?.isBusiness,
+          isEnterprise: !!c?.isEnterprise,
+          hasChat: !!c?.hasChat,
+          type: 'private',
+          updatedAt: FieldValue.serverTimestamp(),
+        };
+
+        const existing = existingByDigits.get(digits);
+        if (!existing) {
+          ops.push({
+            ref,
+            set: {
+              ...incoming,
+              createdAt: FieldValue.serverTimestamp(),
+            },
+          });
+          appended++;
+        } else {
+          const diff = diffFillOnly(existing, incoming);
+          if (Object.keys(diff).length) {
+            ops.push({ ref, update: { ...diff, updatedAt: FieldValue.serverTimestamp() } });
+            updated++;
+          } else if (incoming.hasChat !== existing.hasChat) {
+            // Keep hasChat up to date even if fill-only had no other fields
+            ops.push({
+              ref,
+              update: { hasChat: incoming.hasChat, updatedAt: FieldValue.serverTimestamp() },
+            });
+            updated++;
+          }
+        }
+      }
+
+      if (ops.length) await batchedSetOrUpdate(db, ops);
+
+      // Optional: persist chats for contacts that have a chat
+      let chatsPersisted = 0;
+      if (includeChats) {
+        const numbersWithChat = subset
+          .filter((c, idx) => c?.hasChat && !!digitsList[idx])
+          .map((_, idx) => digitsList[idx]);
+
+        if (numbersWithChat.length) {
+          const results = await sessions.getChatsByNumbers({
             accountId,
             label,
-            generatedAt: new Date().toISOString(),
-            count: merged.length,
-            contacts: merged,
-            _meta: {
-              filter: { type: 'private', isMyContact: true, isWAContact: true },
-            },
-          };
+            numbers: numbersWithChat,
+            countryCode: null,
+            withMessages: false,
+            messagesLimit: 1,
+          });
 
-          await saveJson(file, payload);
-
-          storageInfo = {
-            ok: true,
-            bucket: bucket.name,
-            object: objectName,
-            mode: existing ? 'merge' : 'create',
-            error: null,
-            totalStored: merged.length,
-          };
-        } catch (e) {
-          storageInfo.error = String(e?.message || e);
-          console.error('[contacts] write failed:', e);
+          const chatOps = [];
+          for (const r of results) {
+            if (!r?.exists || !r?.waId || !waIdIsCUs(r.waId)) continue;
+            const digits = normalizeDigits(r.normalized || r.input);
+            if (!digits) continue;
+            const ref = chatsCol.doc(docIdForDigits(digits));
+            const payload = {
+              id: r.chat?.id || r.waId,
+              number: digits,
+              name: r.chat?.name || null,
+              isGroup: !!r.chat?.isGroup, // should be false for private
+              unreadCount: r.chat?.unreadCount ?? null,
+              archived: !!r.chat?.archived,
+              pinned: !!r.chat?.pinned,
+              isReadOnly: !!r.chat?.isReadOnly,
+              updatedAt: FieldValue.serverTimestamp(),
+            };
+            chatOps.push({ ref, set: { ...payload, createdAt: FieldValue.serverTimestamp() } });
+          }
+          if (chatOps.length) {
+            await batchedSetOrUpdate(db, chatOps);
+            chatsPersisted = chatOps.length;
+          }
         }
       }
 
@@ -238,29 +310,33 @@ export function buildContactsRouter({ sessions, requireUser, ensureAllowed, buck
         count: subset.length,
         contacts: subset,
         stats: buildStats(subset),
-        storage: storageInfo,
+        persistence: {
+          store: 'firestore',
+          path: `/accounts/${accountId}/sessions/${label}/contacts/*`,
+          appended,
+          updated,
+          chatsPersisted: includeChats ? chatsPersisted : 0,
+        },
       });
     } catch (e) {
       res.status(500).json({ error: 'contacts_failed', detail: String(e?.message || e) });
     }
   });
 
-  // ---------- NEW: async enrichment job ----------
-  // POST /contacts/enrich/start
+  // ---------- POST /contacts/enrich/start ----------
   // body: { accountId, label, numbers: string[] }
-  //
-  // Steps:
-  // 1) Read per-session contacts.json as base.
-  // 2) Split input numbers into "present in contacts.json" vs "absent".
-  // 3) Enqueue a job:
-  //    - present: enrich avatar/bio (sequential, moderate jitter)
-  //    - absent: check registration (sequential), include registered with details
-  // 4) Write/merge into enriched_contacts.json (copy/superset of contacts.json)
-  // 5) Return { jobId } immediately; poll status with GET /contacts/enrich/status
+  // - Splits numbers into present (in contacts collection) vs absent.
+  // - Enrich present (avatar/bio) with small jitter; add absent if registered.
+  // - Writes back to Firestore; marks enrichedAt + enrichedFields.
+  // NOTE: hard cap of 200 numbers per job (reject if above).
   r.post('/contacts/enrich/start', requireUser, async (req, res) => {
     const { accountId, label, numbers } = req.body || {};
     if (!accountId || !label || !Array.isArray(numbers) || numbers.length === 0) {
       return res.status(400).json({ error: 'accountId, label, numbers[] required' });
+    }
+
+    if (numbers.length > 200) {
+      return res.status(413).json({ error: 'too_many_numbers', limit: 200 });
     }
 
     const allowed = await ensureAllowed(req, res, accountId, label);
@@ -270,31 +346,13 @@ export function buildContactsRouter({ sessions, requireUser, ensureAllowed, buck
     if (st !== 'ready') return res.status(409).json({ error: 'session not ready', status: st || null });
 
     try {
-      // Prepare storage paths
-      await ensurePrefix(bucket, `${accountId}`);
-      await ensurePrefix(bucket, `${accountId}/whatsapp`);
-      const sessPrefix = await ensurePrefix(bucket, `${accountId}/whatsapp/${label}`);
+      const { contacts: contactsCol } = sessRefs(db, accountId, label);
+      // Load base contacts present in Firestore
+      const snap = await contactsCol.get();
+      const baseContacts = snap.docs
+        .map((d) => d.data())
+        .filter((c) => !c?.id || waIdIsCUs(c.id));
 
-      const contactsFile = bucket.file(`${sessPrefix}contacts.json`);
-      const enrichedFile = bucket.file(`${sessPrefix}enriched_contacts.json`);
-
-      const base = (await fileExists(contactsFile)) ? await readJsonIfExists(contactsFile) : { contacts: [] };
-      const baseContacts = Array.isArray(base?.contacts) ? base.contacts : [];
-
-      // Ensure enriched file exists as a copy (if missing)
-      if (!(await fileExists(enrichedFile))) {
-        const payload = {
-          accountId,
-          label,
-          generatedAt: new Date().toISOString(),
-          count: baseContacts.length,
-          contacts: baseContacts,
-          _meta: { source: 'bootstrap_from_contacts_json' },
-        };
-        await saveJson(enrichedFile, payload);
-      }
-
-      // Build “present” vs “absent” sets by normalized number
       const presentNumbersSet = new Set(baseContacts.map((c) => numberFromContact(c)).filter(Boolean));
       const inNumbers = numbers.map((x) => normalizeDigits(x)).filter(Boolean);
 
@@ -305,26 +363,27 @@ export function buildContactsRouter({ sessions, requireUser, ensureAllowed, buck
         else absent.push(n);
       }
 
-      // Create the job
       const jobId = makeJobId();
       const key = queueKey({ accountId, label });
       const job = {
         id: jobId,
         accountId,
         label,
-        status: 'queued', // 'queued' | 'running' | 'done' | 'error'
+        status: 'queued',
         createdAt: Date.now(),
         startedAt: null,
         finishedAt: null,
         input: { total: inNumbers.length, numbers: inNumbers },
         sets: { present, absent },
         progress: {
-          presentTotal: present.length, presentDone: 0,
-          absentTotal: absent.length, absentDone: 0,
+          presentTotal: present.length,
+          presentDone: 0,
+          absentTotal: absent.length,
+          absentDone: 0,
         },
         storage: {
-          bucket: bucket.name,
-          enrichedObject: `${sessPrefix}enriched_contacts.json`,
+          store: 'firestore',
+          path: `/accounts/${accountId}/sessions/${label}/contacts/*`,
         },
         error: null,
       };
@@ -333,8 +392,7 @@ export function buildContactsRouter({ sessions, requireUser, ensureAllowed, buck
       if (!QUEUES.has(key)) QUEUES.set(key, []);
       QUEUES.get(key).push(jobId);
 
-      // Kick the runner
-      runQueueForKey({ key, sessions, bucket }).catch((e) => {
+      runQueueForKey({ key, db, sessions }).catch((e) => {
         console.error('[enrich runner] unexpected error:', e);
       });
 
@@ -349,7 +407,7 @@ export function buildContactsRouter({ sessions, requireUser, ensureAllowed, buck
     }
   });
 
-  // GET /contacts/enrich/status?accountId=...&label=...&jobId=...
+  // ---------- GET /contacts/enrich/status ----------
   r.get('/contacts/enrich/status', requireUser, async (req, res) => {
     const accountId = String(req.query.accountId || '');
     const label = String(req.query.label || '');
@@ -372,11 +430,10 @@ export function buildContactsRouter({ sessions, requireUser, ensureAllowed, buck
   return r;
 }
 
-// ===== Runner implementation (sequential processing with light jitter) =====
-async function runQueueForKey({ key, sessions, bucket }) {
-  if (RUNNING.has(key)) return; // already running
+// ===== Queue runner (uses Firestore instead of GCS) =====
+async function runQueueForKey({ key, db, sessions }) {
+  if (RUNNING.has(key)) return;
   RUNNING.add(key);
-
   try {
     const q = QUEUES.get(key) || [];
     while (q.length) {
@@ -388,7 +445,7 @@ async function runQueueForKey({ key, sessions, bucket }) {
       job.startedAt = Date.now();
 
       try {
-        await processJob({ job, sessions, bucket });
+        await processJob({ job, db, sessions });
         job.status = 'done';
         job.finishedAt = Date.now();
       } catch (e) {
@@ -402,65 +459,72 @@ async function runQueueForKey({ key, sessions, bucket }) {
   }
 }
 
-async function processJob({ job, sessions, bucket }) {
+async function processJob({ job, db, sessions }) {
   const { accountId, label } = job;
+  const { contacts: contactsCol } = sessRefs(db, accountId, label);
 
-  // Prepare storage paths
-  const sessPrefix = `${accountId}/whatsapp/${label}/`;
-  const enrichedFile = bucket.file(`${sessPrefix}enriched_contacts.json`);
-  const contactsFile = bucket.file(`${sessPrefix}contacts.json`);
+  // Load base list
+  let baseDocs = await contactsCol.get();
+  let baseContacts = baseDocs.docs.map((d) => d.data()).filter((c) => !c?.id || waIdIsCUs(c.id));
 
-  // Load base enriched (or bootstrap from contacts)
-  let enriched = (await fileExists(enrichedFile)) ? await readJsonIfExists(enrichedFile) : null;
-  if (!enriched) {
-    const base = (await fileExists(contactsFile)) ? await readJsonIfExists(contactsFile) : { contacts: [] };
-    enriched = {
-      accountId,
-      label,
-      generatedAt: new Date().toISOString(),
-      count: Array.isArray(base.contacts) ? base.contacts.length : 0,
-      contacts: Array.isArray(base.contacts) ? base.contacts : [],
-      _meta: { source: 'bootstrap_at_job_runtime' },
-    };
-    await saveJson(enrichedFile, enriched);
-  }
-
-  let baseContacts = Array.isArray(enriched.contacts) ? enriched.contacts : [];
-  baseContacts = baseContacts.filter((c) => !c?.id || String(c.id).endsWith('@c.us'));
-
-  // Build lookup maps for present contacts
-  const byNumber = new Map(baseContacts.map((c) => [numberFromContact(c), c]));
+  // Map by digits
+  const byDigits = new Map(baseContacts.map((c) => [numberFromContact(c), c]));
 
   // ---- Phase A: enrich present contacts (avatar/bio) ----
   if (job.sets.present.length) {
-    // Gather contacts for present numbers
+    // Build contact stubs with WA id for the enrich helper
     const presentContacts = job.sets.present
-      .map((n) => byNumber.get(n))
+      .map((n) => byDigits.get(n))
       .filter(Boolean);
 
-    // Use the session’s sequential enrichment helper
+    // Use existing sequential helper (keeps structure); internal jitter is modest.
     const enrichedList = await sessions.enrichContactsSequential({
       accountId,
       label,
       contacts: presentContacts,
     });
 
-    // Merge and update progress (as one step)
-    const { merged } = upsertMerge(baseContacts, enrichedList);
-    enriched.contacts = merged;
-    enriched.count = merged.length;
-    enriched.generatedAt = new Date().toISOString();
-    await saveJson(enrichedFile, enriched);
+    // Write selective updates to Firestore
+    const ops = [];
+    for (const c of enrichedList) {
+      const digits = numberFromContact(c);
+      if (!digits || !waIdIsCUs(c?.id)) continue;
 
-    job.progress.presentDone = job.progress.presentTotal; // batch done
+      const ref = contactsCol.doc(docIdForDigits(digits));
+      const existing = byDigits.get(digits) || {};
+
+      const incoming = {
+        profilePicUrl: c?.profilePicUrl ?? null,
+        about: typeof c?.about === 'string' && c.about.length ? c.about : null,
+      };
+
+      const diff = diffFillOnly(existing, incoming);
+      const changed = changedFields(existing, diff);
+      if (changed.length) {
+        ops.push({
+          ref,
+          update: {
+            ...diff,
+            enrichedAt: FieldValue.serverTimestamp(),
+            enrichedFields: FieldValue.arrayUnion(...changed),
+            updatedAt: FieldValue.serverTimestamp(),
+          },
+        });
+        // update local mirror for subsequent diffs
+        byDigits.set(digits, { ...existing, ...diff });
+      }
+    }
+    if (ops.length) await batchedSetOrUpdate(db, ops);
+
+    job.progress.presentDone = job.progress.presentTotal;
   }
 
   // ---- Phase B: check absent numbers (registration + details) ----
+  const opsAbsent = [];
   for (const n of job.sets.absent) {
-    // Moderate jitter between checks to be nice
-    await sleep(rand(60, 140));
+    // Very small jitter (fast mode)
+    await sleep(rand(8, 25));
 
-    // We use single-number check to update progress per item
     const result = await sessions.checkContactByNumber({
       accountId,
       label,
@@ -469,39 +533,38 @@ async function processJob({ job, sessions, bucket }) {
       withDetails: true,
     });
 
-    if (result?.registered && result?.waId) {
-      const waId = String(result.waId || '');
-      if (!waId.endsWith('@c.us')) {
+    if (result?.registered && result?.waId && waIdIsCUs(result.waId)) {
+      const digits = normalizeDigits(result.normalized || n);
+      if (!digits) {
         job.progress.absentDone += 1;
-        continue; // skip @lid and anything else
+        continue;
       }
-      const contact = {
-        id: waId,
-        number: result.normalized || n,
+
+      const ref = contactsCol.doc(docIdForDigits(digits));
+      const payload = {
+        id: result.waId,
+        number: digits,
         name: result.contact?.name || null,
         pushname: result.contact?.pushname || null,
         shortName: result.contact?.shortName || null,
         isWAContact: true,
-        isMyContact: !!result.contact?.isMyContact, // likely false for non-contacts
+        isMyContact: !!result.contact?.isMyContact,
         isBusiness: !!result.contact?.isBusiness,
         isEnterprise: !!result.contact?.isEnterprise,
         hasChat: !!result.hasChat,
         type: 'private',
         profilePicUrl: result.contact?.profilePicUrl || null,
         about: result.contact?.about || null,
+        createdAt: FieldValue.serverTimestamp(),
+        updatedAt: FieldValue.serverTimestamp(),
+        enrichedAt: FieldValue.serverTimestamp(),
+        enrichedFields: ['profilePicUrl', 'about'],
       };
-
-      const { merged } = upsertMerge(enriched.contacts, [contact]);
-      enriched.contacts = merged;
-      enriched.count = merged.length;
-      enriched.generatedAt = new Date().toISOString();
-      await saveJson(enrichedFile, enriched);
+      opsAbsent.push({ ref, set: payload });
+      byDigits.set(digits, payload); // keep mirror coherent
     }
 
     job.progress.absentDone += 1;
   }
-
-  // Final save (idempotent)
-  enriched.generatedAt = new Date().toISOString();
-  await saveJson(enrichedFile, enriched);
+  if (opsAbsent.length) await batchedSetOrUpdate(db, opsAbsent);
 }
