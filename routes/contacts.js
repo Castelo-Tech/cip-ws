@@ -13,7 +13,7 @@ function sessRefs(db, accountId, label) {
   };
 }
 
-// For message writes under a chat doc
+// For message writes under a chat doc (unused now; kept for compatibility)
 function messagesCol(db, accountId, label, chatDocId) {
   const ses = db.collection('accounts').doc(accountId).collection('sessions').doc(label);
   return ses.collection('chats').doc(chatDocId).collection('messages');
@@ -106,6 +106,13 @@ async function batchedGetAll(db, refs, chunk = 300) {
 // ===== Fields we always refresh (not fill-only) =====
 const ALWAYS_UPDATE_FLAGS = new Set(['registered', 'isWAContact', 'isMyContact', 'hasChat']);
 
+// ===== Snippet helper for last message =====
+function snippetOf(body = '', max = 160) {
+  const s = String(body || '');
+  if (s.length <= max) return s;
+  return s.slice(0, max - 1) + '…';
+}
+
 // ===== In-memory job management =====
 const JOBS = new Map(); // jobId -> job object
 const QUEUES = new Map(); // key accountId::label -> [jobId]
@@ -131,14 +138,13 @@ export function buildContactsRouter({ db, sessions, requireUser, ensureAllowed }
   // ---------- GET /contacts (kept for ad-hoc/manual runs) ----------
   // Sequential (non-job) run:
   //   1) contacts (no details)
-  //   2) chats (+ last N messages)
+  //   2) chats (NO message history) – only lastMessage snippet
   //   3) enrichment (pics/about) fill-only
   r.get('/contacts', requireUser, async (req, res) => {
     const accountId = String(req.query.accountId || '');
     const label = String(req.query.label || '');
     const includeChats = String(req.query.includeChats || '') === '1';
     const wantDetailsAtEnd = ['1', 'true', 'yes'].includes(String(req.query.details || '').toLowerCase());
-    const messagesLimit = Math.max(1, Math.min(100, Number(req.query.messagesLimit) || 10));
 
     if (!accountId || !label) return res.status(400).json({ error: 'accountId, label required' });
     const allowed = await ensureAllowed(req, res, accountId, label);
@@ -149,13 +155,15 @@ export function buildContactsRouter({ db, sessions, requireUser, ensureAllowed }
 
     const phases = {
       contacts: { ok: false, appended: 0, updated: 0 },
-      chats: { ok: !includeChats, chatsPersisted: 0, messagesPersisted: 0, error: null },
+      chats: { ok: !includeChats, chatsPersisted: 0, error: null },
       enrich: { ok: !wantDetailsAtEnd, updated: 0, error: null },
     };
 
     try {
       // ---- Phase 1: CONTACTS (no details) ----
       const all = await sessions.getContacts({ accountId, label, withDetails: false });
+
+      // STRICT filter: private + isMyContact + isWAContact + @c.us
       const subset = all.filter(
         (c) =>
           c?.type === 'private' &&
@@ -220,8 +228,8 @@ export function buildContactsRouter({ db, sessions, requireUser, ensureAllowed }
       if (ops.length) await batchedSetOrUpdate(db, ops);
       phases.contacts = { ok: true, appended, updated };
 
-      // ---- Phase 2: CHATS + MESSAGES ----
-      let chatsPersisted = 0, messagesPersisted = 0;
+      // ---- Phase 2: CHATS (only lastMessage snippet; NO messages persisted) ----
+      let chatsPersisted = 0;
       if (includeChats) {
         try {
           const numbersWithChat = subset
@@ -234,12 +242,10 @@ export function buildContactsRouter({ db, sessions, requireUser, ensureAllowed }
               label,
               numbers: numbersWithChat,
               countryCode: null,
-              withMessages: true,
-              messagesLimit,
+              withMessages: false, // IMPORTANT: don't fetch messages
             });
 
             const chatOps = [];
-            const msgOps = [];
             for (const r of results) {
               if (!r?.exists || !r?.waId || !waIdIsCUs(r.waId)) continue;
               const digits = normalizeDigits(r.normalized || r.input);
@@ -247,47 +253,38 @@ export function buildContactsRouter({ db, sessions, requireUser, ensureAllowed }
 
               const chatDocId = docIdForDigits(digits);
               const cref = chatsCol.doc(chatDocId);
+
+              const lm = r.chat?.lastMessage || null;
               const payload = {
                 id: r.chat?.id || r.waId,
                 number: digits,
                 name: r.chat?.name || null,
-                isGroup: !!r.chat?.isGroup,
+                isGroup: !!r.chat?.isGroup, // should be false for private
                 unreadCount: r.chat?.unreadCount ?? null,
                 archived: !!r.chat?.archived,
                 pinned: !!r.chat?.pinned,
                 isReadOnly: !!r.chat?.isReadOnly,
+                timestamp: r.chat?.timestamp ?? null, // last activity unix
+                // last message snippet (lightweight)
+                lastMessageId: lm?.id || null,
+                lastMessageBody: lm ? snippetOf(lm.body || '') : null,
+                lastMessageType: lm?.type || null,
+                lastMessageFromMe: lm?.fromMe ?? null,
+                lastMessageTimestamp: lm?.timestamp ?? null,
+                lastMessageHasMedia: lm?.hasMedia ?? null,
                 updatedAt: FieldValue.serverTimestamp(),
               };
               chatOps.push({ ref: cref, set: { ...payload, createdAt: FieldValue.serverTimestamp() } });
-
-              if (Array.isArray(r.messages) && r.messages.length) {
-                const mcol = messagesCol(db, accountId, label, chatDocId);
-                for (const m of r.messages) {
-                  if (!m?.id) continue;
-                  const mref = mcol.doc(m.id);
-                  msgOps.push({
-                    ref: mref,
-                    set: {
-                      id: m.id,
-                      chatId: m.chatId || payload.id,
-                      fromMe: !!m.fromMe,
-                      body: m.body ?? '',
-                      type: m.type || null,
-                      timestamp: m.timestamp || null,
-                      hasMedia: !!m.hasMedia,
-                      createdAt: FieldValue.serverTimestamp(),
-                      updatedAt: FieldValue.serverTimestamp(),
-                    },
-                  });
-                }
-              }
             }
-            if (chatOps.length) { await batchedSetOrUpdate(db, chatOps); chatsPersisted = chatOps.length; }
-            if (msgOps.length)  { await batchedSetOrUpdate(db, msgOps);  messagesPersisted = msgOps.length; }
+
+            if (chatOps.length) {
+              await batchedSetOrUpdate(db, chatOps);
+              chatsPersisted = chatOps.length;
+            }
           }
-          phases.chats = { ok: true, chatsPersisted, messagesPersisted, error: null };
+          phases.chats = { ok: true, chatsPersisted, error: null };
         } catch (e) {
-          phases.chats = { ok: false, chatsPersisted: 0, messagesPersisted: 0, error: String(e?.message || e) };
+          phases.chats = { ok: false, chatsPersisted: 0, error: String(e?.message || e) };
         }
       }
 
@@ -355,7 +352,7 @@ export function buildContactsRouter({ db, sessions, requireUser, ensureAllowed }
           appended: phases.contacts.appended,
           updated: phases.contacts.updated,
           chatsPersisted: phases.chats.chatsPersisted,
-          messagesPersisted: phases.chats.messagesPersisted,
+          messagesPersisted: 0, // always 0 now
           enrichUpdated: phases.enrich.updated,
         },
         phases,
@@ -367,7 +364,7 @@ export function buildContactsRouter({ db, sessions, requireUser, ensureAllowed }
 
   // ---------- JOB: FULL SYNC ----------
   // POST /contacts/sync/start
-  // body: { accountId, label, messagesLimit?: number (default 10) }
+  // body: { accountId, label, messagesLimit?: number (ignored now; kept for compatibility) }
   r.post('/contacts/sync/start', requireUser, async (req, res) => {
     const { accountId, label, messagesLimit } = req.body || {};
     if (!accountId || !label) return res.status(400).json({ error: 'accountId, label required' });
@@ -389,13 +386,13 @@ export function buildContactsRouter({ db, sessions, requireUser, ensureAllowed }
       startedAt: null,
       finishedAt: null,
       lastUpdatedAt: null,
-      params: { messagesLimit: Math.max(1, Math.min(100, Number(messagesLimit) || 10)) },
+      params: { messagesLimit: Math.max(1, Math.min(100, Number(messagesLimit) || 10)) }, // not used anymore
       storage: { store: 'firestore', path: `/accounts/${accountId}/sessions/${label}/*` },
       // Stages
       stages: [
         makeStage('read_contacts',   'Read contacts (no details)'),
         makeStage('write_contacts',  'Write/merge contacts'),
-        makeStage('persist_chats',   'Write chats (+ last N messages)'),
+        makeStage('persist_chats',   'Write chats (lastMessage snippet only)'),
         makeStage('enrich_contacts', 'Enrich pics/about (fill-only)'),
       ],
       // Summaries
@@ -536,11 +533,12 @@ async function runQueueForKey({ key, db, sessions }) {
 async function processFullSyncJob({ job, db, sessions }) {
   const { accountId, label } = job;
   const { contacts: contactsCol, chats: chatsCol } = sessRefs(db, accountId, label);
-  const messagesLimit = job.params.messagesLimit;
 
   // Stage 1: read_contacts
   stageSet(job, 'read_contacts', { status: 'running', startedAt: Date.now() });
   const all = await sessions.getContacts({ accountId, label, withDetails: false });
+
+  // STRICT filter: private + isMyContact + isWAContact + @c.us
   const subset = all.filter(
     (c) =>
       c?.type === 'private' &&
@@ -549,6 +547,7 @@ async function processFullSyncJob({ job, db, sessions }) {
       typeof c?.id === 'string' &&
       waIdIsCUs(c.id)
   );
+
   const digitsList = subset.map((c) => numberFromContact(c)).filter(Boolean);
   stageSet(job, 'read_contacts', { status: 'done', finishedAt: Date.now(), total: subset.length, done: subset.length });
 
@@ -606,9 +605,9 @@ async function processFullSyncJob({ job, db, sessions }) {
   job.summary.contactsAppended = appended;
   job.summary.contactsUpdated = updated;
 
-  // Stage 3: persist_chats
+  // Stage 3: persist_chats (only lastMessage snippet)
   stageSet(job, 'persist_chats', { status: 'running', startedAt: Date.now() });
-  let chatsPersisted = 0, messagesPersisted = 0;
+  let chatsPersisted = 0;
   const numbersWithChat = subset
     .filter((c, idx) => c?.hasChat && !!digitsList[idx])
     .map((_, idx) => digitsList[idx]);
@@ -619,12 +618,10 @@ async function processFullSyncJob({ job, db, sessions }) {
       label,
       numbers: numbersWithChat,
       countryCode: null,
-      withMessages: true,
-      messagesLimit,
+      withMessages: false, // no history
     });
 
     const chatOps = [];
-    const msgOps = [];
     for (const r of results) {
       if (!r?.exists || !r?.waId || !waIdIsCUs(r.waId)) continue;
       const digits = normalizeDigits(r.normalized || r.input);
@@ -632,6 +629,8 @@ async function processFullSyncJob({ job, db, sessions }) {
 
       const chatDocId = docIdForDigits(digits);
       const cref = chatsCol.doc(chatDocId);
+
+      const lm = r.chat?.lastMessage || null;
       const payload = {
         id: r.chat?.id || r.waId,
         number: digits,
@@ -641,44 +640,28 @@ async function processFullSyncJob({ job, db, sessions }) {
         archived: !!r.chat?.archived,
         pinned: !!r.chat?.pinned,
         isReadOnly: !!r.chat?.isReadOnly,
+        timestamp: r.chat?.timestamp ?? null,
+        lastMessageId: lm?.id || null,
+        lastMessageBody: lm ? snippetOf(lm.body || '') : null,
+        lastMessageType: lm?.type || null,
+        lastMessageFromMe: lm?.fromMe ?? null,
+        lastMessageTimestamp: lm?.timestamp ?? null,
+        lastMessageHasMedia: lm?.hasMedia ?? null,
         updatedAt: FieldValue.serverTimestamp(),
       };
       chatOps.push({ ref: cref, set: { ...payload, createdAt: FieldValue.serverTimestamp() } });
-
-      if (Array.isArray(r.messages) && r.messages.length) {
-        const mcol = messagesCol(db, accountId, label, chatDocId);
-        for (const m of r.messages) {
-          if (!m?.id) continue;
-          const mref = mcol.doc(m.id);
-          msgOps.push({
-            ref: mref,
-            set: {
-              id: m.id,
-              chatId: m.chatId || payload.id,
-              fromMe: !!m.fromMe,
-              body: m.body ?? '',
-              type: m.type || null,
-              timestamp: m.timestamp || null,
-              hasMedia: !!m.hasMedia,
-              createdAt: FieldValue.serverTimestamp(),
-              updatedAt: FieldValue.serverTimestamp(),
-            },
-          });
-        }
-      }
     }
     if (chatOps.length) { await batchedSetOrUpdate(db, chatOps); chatsPersisted = chatOps.length; }
-    if (msgOps.length)  { await batchedSetOrUpdate(db, msgOps);  messagesPersisted = msgOps.length; }
   }
+
   job.summary.chatsPersisted = chatsPersisted;
-  job.summary.messagesPersisted = messagesPersisted;
+  job.summary.messagesPersisted = 0; // no message history saved
   stageSet(job, 'persist_chats', { status: 'done', finishedAt: Date.now(), total: numbersWithChat.length, done: numbersWithChat.length });
 
   // Stage 4: enrich_contacts
   stageSet(job, 'enrich_contacts', { status: 'running', startedAt: Date.now() });
   let enrichUpdated = 0;
   if (subset.length) {
-    // choose those missing both fields to minimize calls
     const refSnaps = docRefs.length ? await batchedGetAll(db, docRefs, 300) : [];
     const existingMap = new Map();
     for (let i = 0; i < refSnaps.length; i++) {
@@ -739,7 +722,6 @@ async function processNumbersJob({ job, db, sessions }) {
 
   // Stage 2: lookup_numbers
   stageSet(job, 'lookup_numbers', { status: 'running', startedAt: Date.now(), total: normalized.length, done: 0 });
-  // Use batch helper to also grab details when registered
   const results = await sessions.lookupContactsByNumbers({
     accountId,
     label,
@@ -755,7 +737,6 @@ async function processNumbersJob({ job, db, sessions }) {
   // Stage 3: write_numbers (upsert; include unregistered with registered=false)
   stageSet(job, 'write_numbers', { status: 'running', startedAt: Date.now(), total: results.length, done: 0 });
 
-  // Preload existing docs
   const docRefs = normalized.map((d) => contactsCol.doc(docIdForDigits(d)));
   const existingSnaps = docRefs.length ? await batchedGetAll(db, docRefs, 300) : [];
   const existingByDigits = new Map();
@@ -787,7 +768,6 @@ async function processNumbersJob({ job, db, sessions }) {
       hasChat: !!r.hasChat,
       registered: !!r.registered,
       type: 'private',
-      // details when available
       profilePicUrl: r.contact?.profilePicUrl || null,
       about: r.contact?.about || null,
       updatedAt: FieldValue.serverTimestamp(),
@@ -797,12 +777,10 @@ async function processNumbersJob({ job, db, sessions }) {
       ops.push({ ref, set: { ...payload, createdAt: FieldValue.serverTimestamp() } });
       written++;
     } else {
-      // fill-only for details, but always refresh flags (registered, isWAContact, hasChat, isMyContact)
       const baseDiff = diffFillOnly(existing, payload);
       for (const f of ALWAYS_UPDATE_FLAGS) {
         if (payload[f] !== undefined && payload[f] !== existing[f]) baseDiff[f] = payload[f];
       }
-      // Keep id if new valid one appears
       if (payload.id && payload.id !== existing.id) baseDiff.id = payload.id;
       if (Object.keys(baseDiff).length) {
         ops.push({ ref, update: { ...baseDiff, updatedAt: FieldValue.serverTimestamp() } });
@@ -816,7 +794,6 @@ async function processNumbersJob({ job, db, sessions }) {
 
   // Stage 4: enrich_missing (registered only, and only if both fields missing)
   stageSet(job, 'enrich_missing', { status: 'running', startedAt: Date.now() });
-  // Determine who needs enrichment
   const refSnaps = docRefs.length ? await batchedGetAll(db, docRefs, 300) : [];
   const need = [];
   const mapByDigits = new Map();
