@@ -1,3 +1,4 @@
+// routes/contacts.js
 import { Router } from 'express';
 
 /**
@@ -57,8 +58,7 @@ function dedupeMerge(existingArr = [], incomingArr = []) {
       map.set(k, c);
       appended++;
     }
-    // NOTE: per your request we do NOT "enhance" existing objects,
-    // i.e., we don't mutate/patch fields if already present.
+    // NOTE: we do NOT "enhance" existing objects (no field patching).
   }
   const merged = Array.from(map.values());
   // stable-ish order: by number/id
@@ -100,7 +100,7 @@ function buildStats(list = []) {
 export function buildContactsRouter({ sessions, requireUser, ensureAllowed, bucket }) {
   const r = Router();
 
-  // All contacts (and persist per-session private contacts to storage)
+  // All contacts (and persist per-session filtered contacts to storage)
   r.get('/contacts', requireUser, async (req, res) => {
     const accountId = String(req.query.accountId || '');
     const label = String(req.query.label || '');
@@ -119,10 +119,19 @@ export function buildContactsRouter({ sessions, requireUser, ensureAllowed, buck
 
       // Build stats for UI
       const statsAll = buildStats(allContacts);
-      const privOnly = allContacts.filter((c) => c?.type === 'private');
-      const statsPrivate = buildStats(privOnly);
 
-      // --- Write contacts.json (private only) to GCS bucket under per-session path ---
+      // Previous step: type === "private"
+      const privOnly = allContacts.filter((c) => c?.type === 'private');
+
+      // NEW: narrow further to isMyContact === true AND isWAContact === true
+      const persistCandidates = privOnly.filter(
+        (c) => !!c?.isMyContact && !!c?.isWAContact
+      );
+
+      const statsPrivate = buildStats(privOnly);
+      const statsPersisted = buildStats(persistCandidates);
+
+      // --- Write contacts.json (filtered set) to GCS bucket under per-session path ---
       let storageInfo = {
         ok: false,
         bucket: bucket?.name || null,
@@ -130,13 +139,14 @@ export function buildContactsRouter({ sessions, requireUser, ensureAllowed, buck
         mode: null,         // "create" | "merge"
         appended: 0,        // how many new contacts appended (merge)
         totalStored: null,  // final contacts count in stored file
-        error: null
+        error: null,
+        filter: { type: 'private', isMyContact: true, isWAContact: true },
       };
 
       if (bucket) {
         try {
-          const basePrefix = await ensurePrefix(bucket, `${accountId}`);
-          const whatsPrefix = await ensurePrefix(bucket, `${accountId}/whatsapp`);
+          await ensurePrefix(bucket, `${accountId}`);
+          await ensurePrefix(bucket, `${accountId}/whatsapp`);
           const sessPrefix = await ensurePrefix(bucket, `${accountId}/whatsapp/${label}`);
           const objectName = `${sessPrefix}contacts.json`;
           const file = bucket.file(objectName);
@@ -145,18 +155,18 @@ export function buildContactsRouter({ sessions, requireUser, ensureAllowed, buck
           const existingContacts = Array.isArray(existing?.contacts) ? existing.contacts : [];
 
           // Merge by id/number; do NOT mutate existing entries
-          const { merged, appended } = dedupeMerge(existingContacts, privOnly);
+          const { merged, appended } = dedupeMerge(existingContacts, persistCandidates);
 
           const payload = {
             accountId,
             label,
             generatedAt: new Date().toISOString(),
             count: merged.length,
-            contacts: merged,       // ONLY type: "private"
-            // optional provenance fields to help with debugging
+            contacts: merged,       // ONLY (type: "private" && isMyContact && isWAContact)
             _meta: {
               wroteFromDetailsMode: !!withDetails,
               previousCount: existingContacts.length || 0,
+              filter: { type: 'private', isMyContact: true, isWAContact: true },
             },
           };
 
@@ -177,6 +187,7 @@ export function buildContactsRouter({ sessions, requireUser, ensureAllowed, buck
             appended,
             totalStored: merged.length,
             error: null,
+            filter: storageInfo.filter,
           };
         } catch (e) {
           storageInfo = {
@@ -187,20 +198,22 @@ export function buildContactsRouter({ sessions, requireUser, ensureAllowed, buck
             appended: 0,
             totalStored: null,
             error: String(e?.message || e),
+            filter: storageInfo.filter,
           };
           // We don't fail the endpoint if storage write fails — we still return contacts & stats.
           console.error('[contacts] storage write failed:', e);
         }
       }
 
-      // Response keeps original contacts list (all types), plus stats & storage info
+      // Response keeps original list (all types), plus stats & storage info
       res.json({
         ok: true,
         count: allContacts.length,
-        contacts: allContacts,
+        contacts: allContacts,   // unchanged: contains everything the method gathered
         stats: {
           all: statsAll,
           privateOnly: statsPrivate,
+          persisted: statsPersisted, // NEW: stats for the actually persisted subset
         },
         storage: storageInfo,
       });
