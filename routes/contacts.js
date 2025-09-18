@@ -41,33 +41,61 @@ async function readJsonIfExists(file) {
   }
 }
 
-function dedupeMerge(existingArr = [], incomingArr = []) {
-  // key by id (preferred) else number
+// Upsert merge: add new contacts; update missing fields on existing ones.
+// Returns { merged, appended, updated }.
+function upsertMerge(existingArr = [], incomingArr = []) {
   const keyOf = (c) => (c?.id && String(c.id)) || (c?.number && String(c.number)) || null;
 
   const map = new Map();
   for (const c of existingArr) {
     const k = keyOf(c);
-    if (k) map.set(k, c);
+    if (k) map.set(k, { ...c });
   }
+
   let appended = 0;
-  for (const c of incomingArr) {
-    const k = keyOf(c);
+  let updated = 0;
+
+  for (const inc of incomingArr) {
+    const k = keyOf(inc);
     if (!k) continue;
+
     if (!map.has(k)) {
-      map.set(k, c);
+      map.set(k, { ...inc });
       appended++;
+      continue;
     }
-    // NOTE: we do NOT "enhance" existing objects (no field patching).
+
+    // Shallow "fill in" merge: only set fields that are currently null/undefined/empty.
+    // Prefer incoming values for profilePicUrl/about if existing is falsy.
+    const cur = map.get(k);
+    let changed = false;
+
+    for (const [field, value] of Object.entries(inc)) {
+      const curVal = cur[field];
+      const wantOverwrite =
+        (curVal === null || curVal === undefined || curVal === '') ||
+        ((field === 'profilePicUrl' || field === 'about') && !curVal && !!value);
+
+      if (wantOverwrite && value !== undefined) {
+        cur[field] = value;
+        changed = true;
+      }
+    }
+
+    if (changed) {
+      map.set(k, cur);
+      updated++;
+    }
   }
+
   const merged = Array.from(map.values());
-  // stable-ish order: by number/id
   merged.sort((a, b) => {
     const ka = String(a.number || a.id || '');
     const kb = String(b.number || b.id || '');
     return ka.localeCompare(kb);
   });
-  return { merged, appended };
+
+  return { merged, appended, updated };
 }
 
 function buildStats(list = []) {
@@ -89,7 +117,6 @@ function buildStats(list = []) {
     withProfilePicUrl: countIf((x) => typeof x?.profilePicUrl === 'string' && x.profilePicUrl.length > 0),
     withAbout: countIf((x) => typeof x?.about === 'string' && x.about.length > 0),
   };
-  // union of keys seen (so you can see "all fields we gathered")
   const fieldSet = new Set();
   for (const c of list) Object.keys(c || {}).forEach((k) => fieldSet.add(k));
   const fields = Array.from(fieldSet).sort();
@@ -100,11 +127,11 @@ function buildStats(list = []) {
 export function buildContactsRouter({ sessions, requireUser, ensureAllowed, bucket }) {
   const r = Router();
 
-  // All contacts (and persist per-session filtered contacts to storage)
+  // Narrowed contacts + per-session persistence + sequential enrichment
   r.get('/contacts', requireUser, async (req, res) => {
     const accountId = String(req.query.accountId || '');
     const label = String(req.query.label || '');
-    const withDetails = String(req.query.details || 'false') === 'true';
+    // We ignore ?details for the base fetch: we will enrich the filtered subset regardless.
 
     if (!accountId || !label) return res.status(400).json({ error: 'accountId, label required' });
 
@@ -115,62 +142,98 @@ export function buildContactsRouter({ sessions, requireUser, ensureAllowed, buck
     if (st !== 'ready') return res.status(409).json({ error: 'session not ready', status: st || null });
 
     try {
-      const allContacts = await sessions.getContacts({ accountId, label, withDetails });
+      // 1) Fetch baseline (no details here; we will enrich subset sequentially)
+      const all = await sessions.getContacts({ accountId, label, withDetails: false });
 
-      // Build stats for UI
-      const statsAll = buildStats(allContacts);
-
-      // Previous step: type === "private"
-      const privOnly = allContacts.filter((c) => c?.type === 'private');
-
-      // NEW: narrow further to isMyContact === true AND isWAContact === true
-      const persistCandidates = privOnly.filter(
-        (c) => !!c?.isMyContact && !!c?.isWAContact
+      // 2) Filter down to the required subset
+      const subset = all.filter(
+        (c) => c?.type === 'private' && !!c?.isMyContact && !!c?.isWAContact
       );
 
-      const statsPrivate = buildStats(privOnly);
-      const statsPersisted = buildStats(persistCandidates);
-
-      // --- Write contacts.json (filtered set) to GCS bucket under per-session path ---
+      // --- Prepare storage path ---
       let storageInfo = {
         ok: false,
         bucket: bucket?.name || null,
         object: null,
-        mode: null,         // "create" | "merge"
-        appended: 0,        // how many new contacts appended (merge)
-        totalStored: null,  // final contacts count in stored file
+        mode: null,
         error: null,
-        filter: { type: 'private', isMyContact: true, isWAContact: true },
+        phase1: { appended: 0, updated: 0, totalStored: null },
+        phase2: { appended: 0, updated: 0, totalStored: null },
       };
+
+      let objectName = null;
+      let file = null;
+      let existingContacts = [];
+      let mergedAfterPhase1 = [];
 
       if (bucket) {
         try {
           await ensurePrefix(bucket, `${accountId}`);
           await ensurePrefix(bucket, `${accountId}/whatsapp`);
           const sessPrefix = await ensurePrefix(bucket, `${accountId}/whatsapp/${label}`);
-          const objectName = `${sessPrefix}contacts.json`;
-          const file = bucket.file(objectName);
+          objectName = `${sessPrefix}contacts.json`;
+          file = bucket.file(objectName);
 
           const existing = (await fileExists(file)) ? await readJsonIfExists(file) : null;
-          const existingContacts = Array.isArray(existing?.contacts) ? existing.contacts : [];
+          existingContacts = Array.isArray(existing?.contacts) ? existing.contacts : [];
 
-          // Merge by id/number; do NOT mutate existing entries
-          const { merged, appended } = dedupeMerge(existingContacts, persistCandidates);
+          storageInfo.mode = existing ? 'merge' : 'create';
 
-          const payload = {
+          // 3) PHASE 1 — quick write of the filtered subset (upsert)
+          {
+            const { merged, appended, updated } = upsertMerge(existingContacts, subset);
+            mergedAfterPhase1 = merged;
+
+            const payload1 = {
+              accountId,
+              label,
+              generatedAt: new Date().toISOString(),
+              count: merged.length,
+              contacts: merged,
+              _meta: {
+                phase: 1,
+                previousCount: existingContacts.length || 0,
+                filter: { type: 'private', isMyContact: true, isWAContact: true },
+              },
+            };
+
+            await file.save(JSON.stringify(payload1, null, 2), {
+              resumable: false,
+              contentType: 'application/json',
+              metadata: {
+                cacheControl: 'no-cache',
+                metadata: { accountId, label, source: 'contacts_endpoint' },
+              },
+            });
+
+            storageInfo.phase1 = { appended, updated, totalStored: merged.length };
+            storageInfo.ok = true;
+            storageInfo.bucket = bucket.name;
+            storageInfo.object = objectName;
+          }
+
+          // 4) PHASE 2 — sequential enrichment (avatar + bio) over the subset, then upsert again
+          const enriched = await sessions.enrichContactsSequential({
+            accountId, label, contacts: subset
+          });
+
+          const { merged, appended, updated } = upsertMerge(mergedAfterPhase1, enriched);
+
+          const payload2 = {
             accountId,
             label,
             generatedAt: new Date().toISOString(),
             count: merged.length,
-            contacts: merged,       // ONLY (type: "private" && isMyContact && isWAContact)
+            contacts: merged,
             _meta: {
-              wroteFromDetailsMode: !!withDetails,
-              previousCount: existingContacts.length || 0,
+              phase: 2,
+              previousCount: mergedAfterPhase1.length,
               filter: { type: 'private', isMyContact: true, isWAContact: true },
+              enrichment: { mode: 'sequential', jitter: { perItemMs: [45,110], everyN: 25, pauseMs: [200,450] } },
             },
           };
 
-          await file.save(JSON.stringify(payload, null, 2), {
+          await file.save(JSON.stringify(payload2, null, 2), {
             resumable: false,
             contentType: 'application/json',
             metadata: {
@@ -179,42 +242,33 @@ export function buildContactsRouter({ sessions, requireUser, ensureAllowed, buck
             },
           });
 
-          storageInfo = {
-            ok: true,
-            bucket: bucket.name,
-            object: objectName,
-            mode: existing ? 'merge' : 'create',
-            appended,
-            totalStored: merged.length,
-            error: null,
-            filter: storageInfo.filter,
-          };
+          storageInfo.phase2 = { appended, updated, totalStored: merged.length };
         } catch (e) {
-          storageInfo = {
-            ok: false,
-            bucket: bucket?.name || null,
-            object: null,
-            mode: null,
-            appended: 0,
-            totalStored: null,
-            error: String(e?.message || e),
-            filter: storageInfo.filter,
-          };
-          // We don't fail the endpoint if storage write fails — we still return contacts & stats.
+          storageInfo.ok = false;
+          storageInfo.error = String(e?.message || e);
+          // We still return the enriched subset below even if storage fails.
           console.error('[contacts] storage write failed:', e);
         }
       }
 
-      // Response keeps original list (all types), plus stats & storage info
+      // 5) Always return ONLY the filtered subset; return the enriched form
+      let subsetForResponse = [];
+      try {
+        subsetForResponse = await sessions.enrichContactsSequential({
+          accountId, label, contacts: subset
+        });
+      } catch {
+        // Best effort; fall back to base subset if enrich failed
+        subsetForResponse = subset;
+      }
+
+      const stats = buildStats(subsetForResponse);
+
       res.json({
         ok: true,
-        count: allContacts.length,
-        contacts: allContacts,   // unchanged: contains everything the method gathered
-        stats: {
-          all: statsAll,
-          privateOnly: statsPrivate,
-          persisted: statsPersisted, // NEW: stats for the actually persisted subset
-        },
+        count: subsetForResponse.length,
+        contacts: subsetForResponse,   // ONLY the filtered (and enriched) subset
+        stats,                         // stats for the returned subset
         storage: storageInfo,
       });
     } catch (e) {
