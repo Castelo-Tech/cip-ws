@@ -15,6 +15,12 @@ function sessRefs(db, accountId, label) {
   };
 }
 
+// For message writes under a chat doc
+function messagesCol(db, accountId, label, chatDocId) {
+  const ses = db.collection('accounts').doc(accountId).collection('sessions').doc(label);
+  return ses.collection('chats').doc(chatDocId).collection('messages');
+}
+
 // ===== Normalization helpers =====
 function normalizeDigits(s) {
   return String(s || '').replace(/[^\d]/g, '');
@@ -26,7 +32,7 @@ function numberFromContact(c) {
   return '';
 }
 function docIdForDigits(digits) {
-  return normalizeDigits(digits); // contact docId = numeric phone
+  return normalizeDigits(digits); // contact/chat docId = numeric phone
 }
 function waIdIsCUs(id) {
   return typeof id === 'string' && id.endsWith('@c.us');
@@ -166,14 +172,16 @@ export function buildContactsRouter({ db, sessions, requireUser, ensureAllowed }
   const r = Router();
 
   // ---------- GET /contacts ----------
-  // - Pull live contacts from WA (no enrichment here).
+  // - Pull live contacts from WA (optional details with pics/about via ?details=1).
   // - Filter to private + isMyContact + isWAContact + @c.us
   // - Upsert into Firestore under /accounts/{aid}/sessions/{label}/contacts/{digits}
-  // - Optionally also persist chats for those contacts with hasChat (?includeChats=1)
+  // - Optionally also persist chats (+ last N messages) for contacts that have a chat (?includeChats=1&messagesLimit=10)
   r.get('/contacts', requireUser, async (req, res) => {
     const accountId = String(req.query.accountId || '');
     const label = String(req.query.label || '');
     const includeChats = String(req.query.includeChats || '') === '1';
+    const includeDetails = ['1', 'true', 'yes'].includes(String(req.query.details || '').toLowerCase());
+    const messagesLimit = Math.max(1, Math.min(100, Number(req.query.messagesLimit) || 10));
 
     if (!accountId || !label) return res.status(400).json({ error: 'accountId, label required' });
 
@@ -184,7 +192,7 @@ export function buildContactsRouter({ db, sessions, requireUser, ensureAllowed }
     if (st !== 'ready') return res.status(409).json({ error: 'session not ready', status: st || null });
 
     try {
-      const all = await sessions.getContacts({ accountId, label, withDetails: false });
+      const all = await sessions.getContacts({ accountId, label, withDetails: includeDetails });
 
       const subset = all.filter(
         (c) =>
@@ -231,6 +239,11 @@ export function buildContactsRouter({ db, sessions, requireUser, ensureAllowed }
           isEnterprise: !!c?.isEnterprise,
           hasChat: !!c?.hasChat,
           type: 'private',
+          // If includeDetails=true we will try to keep pics/about (fill-only)
+          ...(includeDetails ? {
+            profilePicUrl: c?.profilePicUrl ?? null,
+            about: (typeof c?.about === 'string' && c.about.length) ? c.about : null,
+          } : {}),
           updatedAt: FieldValue.serverTimestamp(),
         };
 
@@ -241,19 +254,26 @@ export function buildContactsRouter({ db, sessions, requireUser, ensureAllowed }
             set: {
               ...incoming,
               createdAt: FieldValue.serverTimestamp(),
+              ...(includeDetails ? { enrichedAt: FieldValue.serverTimestamp(), enrichedFields: ['profilePicUrl', 'about'] } : {}),
             },
           });
           appended++;
         } else {
-          const diff = diffFillOnly(existing, incoming);
-          if (Object.keys(diff).length) {
-            ops.push({ ref, update: { ...diff, updatedAt: FieldValue.serverTimestamp() } });
-            updated++;
-          } else if (incoming.hasChat !== existing.hasChat) {
-            // Keep hasChat up to date even if fill-only had no other fields
+          // fill-only on pics/about; always refresh hasChat
+          const baseDiff = diffFillOnly(existing, incoming);
+          const needsHasChatUpdate = incoming.hasChat !== existing.hasChat;
+          const updateObj = { ...baseDiff };
+          if (needsHasChatUpdate) updateObj.hasChat = incoming.hasChat;
+          if (Object.keys(updateObj).length) {
+            // enriched fields bookkeeping if any of those changed
+            const ch = changedFields(existing, updateObj);
             ops.push({
               ref,
-              update: { hasChat: incoming.hasChat, updatedAt: FieldValue.serverTimestamp() },
+              update: {
+                ...updateObj,
+                ...(ch.length ? { enrichedAt: FieldValue.serverTimestamp(), enrichedFields: FieldValue.arrayUnion(...ch) } : {}),
+                updatedAt: FieldValue.serverTimestamp(),
+              },
             });
             updated++;
           }
@@ -262,46 +282,102 @@ export function buildContactsRouter({ db, sessions, requireUser, ensureAllowed }
 
       if (ops.length) await batchedSetOrUpdate(db, ops);
 
-      // Optional: persist chats for contacts that have a chat
+      // Optional: persist chats for contacts that have a chat (and optionally their last N messages)
       let chatsPersisted = 0;
+      let messagesPersisted = 0;
       if (includeChats) {
-        const numbersWithChat = subset
-          .filter((c, idx) => c?.hasChat && !!digitsList[idx])
-          .map((_, idx) => digitsList[idx]);
+        try {
+          const numbersWithChat = subset
+            .filter((c, idx) => c?.hasChat && !!digitsList[idx])
+            .map((_, idx) => digitsList[idx]);
 
-        if (numbersWithChat.length) {
-          const results = await sessions.getChatsByNumbers({
-            accountId,
-            label,
-            numbers: numbersWithChat,
-            countryCode: null,
-            withMessages: false,
-            messagesLimit: 1,
+          if (numbersWithChat.length) {
+            const results = await sessions.getChatsByNumbers({
+              accountId,
+              label,
+              numbers: numbersWithChat,
+              countryCode: null,
+              withMessages: messagesLimit > 0,
+              messagesLimit,
+            });
+
+            const chatOps = [];
+            const msgOpsByChat = new Map(); // chatDocId -> ops[]
+
+            for (const r of results) {
+              if (!r?.exists || !r?.waId || !waIdIsCUs(r.waId)) continue;
+              const digits = normalizeDigits(r.normalized || r.input);
+              if (!digits) continue;
+
+              const chatDocId = docIdForDigits(digits);
+              const ref = chatsCol.doc(chatDocId);
+              const payload = {
+                id: r.chat?.id || r.waId,
+                number: digits,
+                name: r.chat?.name || null,
+                isGroup: !!r.chat?.isGroup, // should be false for private
+                unreadCount: r.chat?.unreadCount ?? null,
+                archived: !!r.chat?.archived,
+                pinned: !!r.chat?.pinned,
+                isReadOnly: !!r.chat?.isReadOnly,
+                updatedAt: FieldValue.serverTimestamp(),
+              };
+              chatOps.push({ ref, set: { ...payload, createdAt: FieldValue.serverTimestamp() } });
+
+              // Persist last N messages if present
+              if (Array.isArray(r.messages) && r.messages.length) {
+                const mcol = messagesCol(db, accountId, label, chatDocId);
+                const mOps = msgOpsByChat.get(chatDocId) || [];
+                for (const m of r.messages) {
+                  if (!m?.id) continue;
+                  const mref = mcol.doc(m.id);
+                  mOps.push({
+                    ref: mref,
+                    set: {
+                      id: m.id,
+                      chatId: m.chatId || payload.id,
+                      fromMe: !!m.fromMe,
+                      body: m.body ?? '',
+                      type: m.type || null,
+                      timestamp: m.timestamp || null,
+                      hasMedia: !!m.hasMedia,
+                      createdAt: FieldValue.serverTimestamp(),
+                      updatedAt: FieldValue.serverTimestamp(),
+                    },
+                  });
+                }
+                if (mOps.length) msgOpsByChat.set(chatDocId, mOps);
+              }
+            }
+
+            if (chatOps.length) {
+              await batchedSetOrUpdate(db, chatOps);
+              chatsPersisted = chatOps.length;
+            }
+            // Flatten and commit message ops in batches
+            const allMsgOps = Array.from(msgOpsByChat.values()).flat();
+            if (allMsgOps.length) {
+              await batchedSetOrUpdate(db, allMsgOps);
+              messagesPersisted = allMsgOps.length;
+            }
+          }
+        } catch (e) {
+          // graceful: return success for contacts but note chat persistence error
+          return res.json({
+            ok: true,
+            count: subset.length,
+            contacts: subset,
+            stats: buildStats(subset),
+            persistence: {
+              store: 'firestore',
+              path: `/accounts/${accountId}/sessions/${label}/contacts/*`,
+              appended,
+              updated,
+              chatsPersisted: 0,
+              messagesPersisted: 0,
+              chatsError: String(e?.message || e),
+            },
           });
-
-          const chatOps = [];
-          for (const r of results) {
-            if (!r?.exists || !r?.waId || !waIdIsCUs(r.waId)) continue;
-            const digits = normalizeDigits(r.normalized || r.input);
-            if (!digits) continue;
-            const ref = chatsCol.doc(docIdForDigits(digits));
-            const payload = {
-              id: r.chat?.id || r.waId,
-              number: digits,
-              name: r.chat?.name || null,
-              isGroup: !!r.chat?.isGroup, // should be false for private
-              unreadCount: r.chat?.unreadCount ?? null,
-              archived: !!r.chat?.archived,
-              pinned: !!r.chat?.pinned,
-              isReadOnly: !!r.chat?.isReadOnly,
-              updatedAt: FieldValue.serverTimestamp(),
-            };
-            chatOps.push({ ref, set: { ...payload, createdAt: FieldValue.serverTimestamp() } });
-          }
-          if (chatOps.length) {
-            await batchedSetOrUpdate(db, chatOps);
-            chatsPersisted = chatOps.length;
-          }
         }
       }
 
@@ -316,6 +392,7 @@ export function buildContactsRouter({ db, sessions, requireUser, ensureAllowed }
           appended,
           updated,
           chatsPersisted: includeChats ? chatsPersisted : 0,
+          messagesPersisted: includeChats ? messagesPersisted : 0,
         },
       });
     } catch (e) {
