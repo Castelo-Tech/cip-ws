@@ -2,18 +2,22 @@
 import { Router } from 'express';
 import { FieldValue } from 'firebase-admin/firestore';
 
-// ===== Path + id helpers (session-scoped Firestore structure) =====
+/* ===============================
+ * Session-scoped Firestore paths
+ * =============================== */
 function sessRefs(db, accountId, label) {
   const base = db.collection('accounts').doc(accountId).collection('sessions').doc(label);
   return {
     base,
     contacts: base.collection('contacts'),
-    // chats collection kept for forward-compat, unused in this contacts-only workflow:
+    // chats kept for forward-compat (unused here)
     chats: base.collection('chats'),
   };
 }
 
-// ===== Normalization helpers =====
+/* =====================
+ * Normalization helpers
+ * ===================== */
 function normalizeDigits(s) {
   return String(s || '').replace(/[^\d]/g, '');
 }
@@ -26,7 +30,9 @@ function numberFromContact(c) {
 function docIdForDigits(digits) { return normalizeDigits(digits); }
 function waIdIsCUs(id) { return typeof id === 'string' && id.endsWith('@c.us'); }
 
-// ===== Stats (for response) =====
+/* =========================
+ * Stats (for GET /contacts)
+ * ========================= */
 function buildStats(list = []) {
   const total = list.length;
   const countIf = (fn) => list.reduce((n, x) => (fn(x) ? n + 1 : n), 0);
@@ -52,10 +58,12 @@ function buildStats(list = []) {
   return { total, byType, flags, details, fields };
 }
 
-// ===== Firestore upsert utils =====
+/* ========================
+ * Firestore upsert helpers
+ * ======================== */
 function diffFillOnly(existing, incoming) {
-  // Only include fields where existing is empty/undefined/null
-  // OR "profilePicUrl/about" when currently empty (fill-only enrichment).
+  // Only include fields where existing is empty/undefined/null.
+  // Always allow fill-only for profilePicUrl/about.
   const out = {};
   for (const [k, v] of Object.entries(incoming)) {
     const cur = existing?.[k];
@@ -82,8 +90,11 @@ async function batchedSetOrUpdate(db, ops) {
     const batch = db.batch();
     const slice = ops.slice(i, i + CHUNK);
     for (const op of slice) {
-      if (op.set) batch.set(op.ref, op.set, { merge: true });
-      if (op.update && Object.keys(op.update).length) batch.set(op.ref, op.update, { merge: true });
+      if (op.set) {
+        batch.set(op.ref, op.set, { merge: true });
+      } else if (op.update && Object.keys(op.update).length) {
+        batch.update(op.ref, op.update);
+      }
     }
     await batch.commit();
   }
@@ -98,14 +109,17 @@ async function batchedGetAll(db, refs, chunk = 300) {
   return snaps;
 }
 
-// ===== Fields we always refresh (not fill-only) =====
+/* =============================
+ * Always-refreshed boolean flags
+ * ============================= */
 const ALWAYS_UPDATE_FLAGS = new Set(['registered', 'isWAContact', 'isMyContact', 'hasChat']);
 
-// ===== In-memory job management =====
+/* ========================
+ * In-memory job management
+ * ======================== */
 const JOBS = new Map();       // jobId -> job object
 const QUEUES = new Map();     // key accountId::label -> [jobId]
 const RUNNING = new Set();    // keys currently running
-
 function queueKey({ accountId, label }) { return `${accountId}::${label}`; }
 function makeJobId() { return `job_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`; }
 
@@ -114,12 +128,14 @@ function makeStage(key, label) {
 }
 function stageSet(job, key, patch) {
   const st = job.stages.find((s) => s.key === key);
-  if (!st) return;
+  if (!st) return; // stage might be omitted (e.g., enrich off)
   Object.assign(st, patch);
   job.lastUpdatedAt = Date.now();
 }
 
-// ===== Small shared helpers to avoid duplication =====
+/* ==========================
+ * Shared contact list helpers
+ * ========================== */
 function filterStrictCUs(contacts) {
   return contacts.filter(
     (c) =>
@@ -191,14 +207,16 @@ function upsertContactsOps(subset, digitsList, existingByDigits, contactsCol) {
   return { ops, appended, updated, appendedDigits };
 }
 
-// ===== Router =====
+/* ============
+ * The Router
+ * ============ */
 export function buildContactsRouter({ db, sessions, requireUser, ensureAllowed }) {
   const r = Router();
 
-  // ---------- GET /contacts (ad-hoc/manual) ----------
-  // Sequential (non-job) run:
-  //   1) contacts (no details)
-  //   2) enrichment (pics/about) fill-only
+  /* -----------------------------------------
+   * GET /contacts  (ad-hoc fetch + diff writes)
+   * ?details=true → fill-only enrichment (pics/about)
+   * ----------------------------------------- */
   r.get('/contacts', requireUser, async (req, res) => {
     const accountId = String(req.query.accountId || '');
     const label = String(req.query.label || '');
@@ -217,7 +235,7 @@ export function buildContactsRouter({ db, sessions, requireUser, ensureAllowed }
     };
 
     try {
-      // ---- Phase 1: CONTACTS (no details) ----
+      // Phase 1: baseline contacts (no details)
       const all = await sessions.getContacts({ accountId, label, withDetails: false });
       const subset = filterStrictCUs(all);
       const digitsList = digitsForList(subset);
@@ -231,10 +249,9 @@ export function buildContactsRouter({ db, sessions, requireUser, ensureAllowed }
       if (ops.length) await batchedSetOrUpdate(db, ops);
       phases.contacts = { ok: true, appended, updated };
 
-      // ---- Phase 2: ENRICH (pics/about) ----
+      // Phase 2: targeted enrich (fill-only), optional via ?details=true
       let enrichUpdated = 0;
       if (wantDetailsAtEnd && subset.length) {
-        // Enrich if the doc didn't exist before OR both fields are still missing.
         const needEnrich = subset.filter((c, i) => {
           const d = digitsList[i];
           const ex = existingByDigits.get(d);
@@ -292,11 +309,13 @@ export function buildContactsRouter({ db, sessions, requireUser, ensureAllowed }
     }
   });
 
-  // ---------- JOB: FULL SYNC (contacts only) ----------
-  // POST /contacts/sync/start
-  // body: { accountId, label }    // messagesLimit removed (ignored if client sends it)
+  /* ---------------------------------------------------------
+   * JOB: FULL SYNC (contacts only; NO ENRICH BY DEFAULT)
+   * POST /contacts/sync/start   { accountId, label, enrich?: boolean }
+   * GET  /contacts/sync/status  { accountId, label, jobId }
+   * --------------------------------------------------------- */
   r.post('/contacts/sync/start', requireUser, async (req, res) => {
-    const { accountId, label } = req.body || {};
+    const { accountId, label, enrich = false } = req.body || {};
     if (!accountId || !label) return res.status(400).json({ error: 'accountId, label required' });
 
     const allowed = await ensureAllowed(req, res, accountId, label);
@@ -316,12 +335,12 @@ export function buildContactsRouter({ db, sessions, requireUser, ensureAllowed }
       startedAt: null,
       finishedAt: null,
       lastUpdatedAt: null,
-      params: {}, // messagesLimit removed
+      params: { enrich: !!enrich },
       storage: { store: 'firestore', path: `/accounts/${accountId}/sessions/${label}/*` },
       stages: [
         makeStage('read_contacts',   'Read contacts (no details)'),
         makeStage('write_contacts',  'Write/merge contacts'),
-        makeStage('enrich_contacts', 'Enrich pics/about (fill-only)'),
+        ...(enrich ? [makeStage('enrich_contacts', 'Enrich pics/about (fill-only)')] : []),
       ],
       summary: { contactsAppended: 0, contactsUpdated: 0, enrichUpdated: 0 },
       error: null,
@@ -349,10 +368,12 @@ export function buildContactsRouter({ db, sessions, requireUser, ensureAllowed }
     res.json({ ok: true, job });
   });
 
-  // ---------- JOB: LOOKUP (bulk numbers → upsert → enrich-missing) ----------
-  // CANONICAL: POST /contacts/lookup/start
-  // body: { accountId, label, numbers: string[], countryCode?: string }
-  // Alias maintained: POST /contacts/enrich/start (old name)
+  /* ----------------------------------------------------------------------
+   * JOB: LOOKUP (bulk numbers → upsert → targeted enrich if still missing)
+   * POST /contacts/lookup/start  { accountId, label, numbers[], countryCode? }
+   * GET  /contacts/lookup/status { accountId, label, jobId }
+   * (Aliases kept for back-compat: /contacts/enrich/start|status)
+   * ---------------------------------------------------------------------- */
   async function startLookupJob(req, res) {
     const { accountId, label, numbers, countryCode = null } = req.body || {};
     if (!accountId || !label || !Array.isArray(numbers) || numbers.length === 0) {
@@ -368,10 +389,9 @@ export function buildContactsRouter({ db, sessions, requireUser, ensureAllowed }
 
     const jobId = makeJobId();
     const key = queueKey({ accountId, label });
-
     const job = {
       id: jobId,
-      kind: 'lookup', // renamed from 'numbers'
+      kind: 'lookup',
       accountId, label,
       status: 'queued',
       createdAt: Date.now(),
@@ -395,7 +415,6 @@ export function buildContactsRouter({ db, sessions, requireUser, ensureAllowed }
     QUEUES.get(key).push(jobId);
     runQueueForKey({ key, db, sessions }).catch((e) => console.error('[lookup runner] unexpected error:', e));
 
-    // For back-compat we keep these nulls; callers can ignore them.
     res.json({ ok: true, jobId, presentCount: null, absentCount: null });
   }
   r.post('/contacts/lookup/start', requireUser, startLookupJob);
@@ -423,7 +442,9 @@ export function buildContactsRouter({ db, sessions, requireUser, ensureAllowed }
   return r;
 }
 
-// ===== Queue runner =====
+/* =================
+ * Queue coordinator
+ * ================= */
 async function runQueueForKey({ key, db, sessions }) {
   if (RUNNING.has(key)) return;
   RUNNING.add(key);
@@ -459,7 +480,9 @@ async function runQueueForKey({ key, db, sessions }) {
   }
 }
 
-// ===== Job processors =====
+/* ==================
+ * Job: FULL SYNC
+ * ================== */
 async function processFullSyncJob({ job, db, sessions }) {
   const { accountId, label } = job;
   const { contacts: contactsCol } = sessRefs(db, accountId, label);
@@ -483,7 +506,9 @@ async function processFullSyncJob({ job, db, sessions }) {
   job.summary.contactsAppended = appended;
   job.summary.contactsUpdated = updated;
 
-  // Stage 3: enrich_contacts (no re-read; use existingByDigits + appendedDigits)
+  // Stage 3 (optional): enrich_contacts
+  if (!job.params?.enrich) return;
+
   stageSet(job, 'enrich_contacts', { status: 'running', startedAt: Date.now() });
   let enrichUpdated = 0;
 
@@ -491,6 +516,7 @@ async function processFullSyncJob({ job, db, sessions }) {
     const needEnrich = subset.filter((c, i) => {
       const d = digitsList[i];
       const ex = existingByDigits.get(d);
+      // only appended or still missing both details
       return appendedDigits.has(d) || (ex && !ex.profilePicUrl && !ex.about);
     });
 
@@ -529,6 +555,9 @@ async function processFullSyncJob({ job, db, sessions }) {
   stageSet(job, 'enrich_contacts', { status: 'done', finishedAt: Date.now(), done: enrichUpdated });
 }
 
+/* ==================
+ * Job: LOOKUP (numbers)
+ * ================== */
 async function processLookupJob({ job, db, sessions }) {
   const { accountId, label } = job;
   const { contacts: contactsCol } = sessRefs(db, accountId, label);
@@ -547,15 +576,15 @@ async function processLookupJob({ job, db, sessions }) {
     accountId,
     label,
     numbers: normalized,
-    countryCode,       // NEW: forwarded if provided
-    withDetails: true,
+    countryCode,       // forwarded if provided
+    withDetails: true, // keep details here
   });
   const registeredCount = results.reduce((n, r) => (r?.registered ? n + 1 : n), 0);
   stageSet(job, 'lookup_numbers', { status: 'done', finishedAt: Date.now(), done: results.length });
   job.summary.registered = registeredCount;
   job.summary.unregistered = results.length - registeredCount;
 
-  // Stage 3: write_numbers (upsert; include unregistered with registered=false)
+  // Stage 3: write_numbers (upsert; include unregistered w/ registered=false)
   stageSet(job, 'write_numbers', { status: 'running', startedAt: Date.now(), total: results.length, done: 0 });
 
   const docRefs = normalized.map((d) => contactsCol.doc(docIdForDigits(d)));
@@ -570,6 +599,7 @@ async function processLookupJob({ job, db, sessions }) {
   const ops = [];
   let written = 0;
   const appendedDigits = new Set();
+  const detailsPresent = new Map(); // track if details already stored via payload
 
   for (const r of results) {
     const digits = normalizeDigits(r.normalized || r.input);
@@ -579,11 +609,11 @@ async function processLookupJob({ job, db, sessions }) {
     const ref = contactsCol.doc(docIdForDigits(digits));
 
     const payload = {
-      id: (r.waId && waIdIsCUs(r.waId)) ? r.waId : null,
+      id: (r.waId && waIdIsCUs(r.waId)) ? r.waId : (existing?.id || null),
       number: digits,
-      name: r.contact?.name || null,
-      pushname: r.contact?.pushname || null,
-      shortName: r.contact?.shortName || null,
+      name: r.contact?.name || existing?.name || null,
+      pushname: r.contact?.pushname || existing?.pushname || null,
+      shortName: r.contact?.shortName || existing?.shortName || null,
       isWAContact: !!r.registered,
       isMyContact: !!r.contact?.isMyContact,
       isBusiness: !!r.contact?.isBusiness,
@@ -591,50 +621,58 @@ async function processLookupJob({ job, db, sessions }) {
       hasChat: !!r.hasChat,
       registered: !!r.registered,
       type: 'private',
-      // details when available
       profilePicUrl: r.contact?.profilePicUrl || null,
       about: r.contact?.about || null,
       updatedAt: FieldValue.serverTimestamp(),
     };
+
+    detailsPresent.set(digits, !!(payload.profilePicUrl || payload.about));
 
     if (!existing) {
       ops.push({ ref, set: { ...payload, createdAt: FieldValue.serverTimestamp() } });
       written++;
       appendedDigits.add(digits);
     } else {
-      // fill-only for details, but always refresh flags (registered, isWAContact, hasChat, isMyContact)
       const baseDiff = diffFillOnly(existing, payload);
       for (const f of ALWAYS_UPDATE_FLAGS) {
         if (payload[f] !== undefined && payload[f] !== existing[f]) baseDiff[f] = payload[f];
       }
-      // Keep id if new valid one appears
       if (payload.id && payload.id !== existing.id) baseDiff.id = payload.id;
+
       if (Object.keys(baseDiff).length) {
         ops.push({ ref, update: { ...baseDiff, updatedAt: FieldValue.serverTimestamp() } });
         written++;
       }
     }
   }
+
   if (ops.length) await batchedSetOrUpdate(db, ops);
   stageSet(job, 'write_numbers', { status: 'done', finishedAt: Date.now(), done: results.length });
   job.summary.written = written;
 
-  // Stage 4: enrich_missing (registered only, and only if both fields missing) — no re-read
+  // Stage 4: enrich_missing — ONLY if still missing after Stage 3
   stageSet(job, 'enrich_missing', { status: 'running', startedAt: Date.now() });
   let enrichUpdated = 0;
 
-  // Build a cheap view from existingByDigits + appendedDigits
   const need = [];
   for (const r of results) {
     const digits = normalizeDigits(r.normalized || r.input);
     if (!digits) continue;
+
+    // if the write step already stored details, skip enrichment
+    if (detailsPresent.get(digits)) continue;
+
     const ex = existingByDigits.get(digits);
-    const should = appendedDigits.has(digits) || (!!ex && ex.registered && !ex.profilePicUrl && !ex.about && ex.id && waIdIsCUs(ex.id));
-    if (should) {
-      // minimal object for enrich API
-      const waId = (r.waId && waIdIsCUs(r.waId)) ? r.waId : ex?.id;
-      if (waId && waIdIsCUs(waId)) need.push({ id: waId, number: digits, type: 'private' });
-    }
+    const isRegistered = !!r.registered || !!ex?.registered;
+    if (!isRegistered) continue;
+
+    const waId = (r.waId && waIdIsCUs(r.waId)) ? r.waId : (ex?.id && waIdIsCUs(ex.id) ? ex.id : null);
+    if (!waId) continue;
+
+    const wasMissingBefore = !ex?.profilePicUrl && !ex?.about;
+    const shouldEnrich = appendedDigits.has(digits) || wasMissingBefore;
+
+    if (shouldEnrich) need.push({ id: waId, number: digits, type: 'private' });
   }
 
   if (need.length) {
