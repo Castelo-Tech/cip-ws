@@ -1,7 +1,4 @@
 // bot/buffer/BufferManager.js
-// Per-(accountId,label,chatId) debounced buffers that write Turn docs (status:"pending").
-// Now gated by BotPolicy so you can turn sessions/chats on/off and prevent bot-to-bot loops.
-
 import { assembleTurn } from './TurnAssembler.js';
 import { isFinalizer } from './MessageHints.js';
 
@@ -10,23 +7,17 @@ export class BufferManager {
     this.db = db;
     this.cfg = config;
     this.policy = policy;
-    this.map = new Map(); // key -> { items: [], timer, openedAt, lastAt }
+    this.map = new Map();
     this.gcTimer = null;
   }
 
-  keyOf(meta) {
-    return `${meta.accountId}::${meta.label}::${meta.chatId}`;
-  }
+  keyOf(meta) { return `${meta.accountId}::${meta.label}::${meta.chatId}`; }
 
   startGC() {
     if (this.gcTimer) return;
     this.gcTimer = setInterval(() => this.gcSweep(), 60_000);
   }
-
-  stopGC() {
-    if (this.gcTimer) clearInterval(this.gcTimer);
-    this.gcTimer = null;
-  }
+  stopGC() { if (this.gcTimer) clearInterval(this.gcTimer); this.gcTimer = null; }
 
   gcSweep() {
     const now = Date.now();
@@ -40,25 +31,26 @@ export class BufferManager {
     }
   }
 
-  // evt shape from your sessionManager: { accountId, sessionId(label), chatId, fromMe, body, waTimestamp, ... }
+  // evt from sessionManager: { accountId, sessionId(label), chatId, fromMe, body, waTimestamp, ... }
   push(evt) {
-    if (!evt || evt.fromMe) return; // only inbound
+    // Never react to our own outbound messages
+    if (!evt || evt.fromMe) return;
+
     const accountId = String(evt.accountId || '');
     const label = String(evt.sessionId || evt.label || '');
     const chatId = String(evt.chatId || '');
     if (!accountId || !label || !chatId) return;
 
-    // For inbound messages, the "sender" is the remote chatId itself.
+    // For 1:1 chats, inbound sender == chatId
     const senderWaId = chatId;
 
-    // Gate via policy (async), then continue
-    this.policy
-      .allowProcess({ aid: accountId, label, chatId, senderWaId })
-      .then((allow) => {
+    // Gate by policy (session toggle & per-chat opt-out; also ignores same-number)
+    this.policy.allowProcess({ aid: accountId, label, chatId, senderWaId })
+      .then(allow => {
         if (!allow) return;
         this._pushAllowed(evt, { accountId, label, chatId });
       })
-      .catch((e) => console.error('[BufferManager] policy.allowProcess error', e));
+      .catch(e => console.error('[BufferManager] policy.allowProcess error', e));
   }
 
   _pushAllowed(evt, ids) {
@@ -70,28 +62,24 @@ export class BufferManager {
     const k = this.keyOf({ accountId, label, chatId });
     const st = this.map.get(k) || { items: [], timer: null, openedAt: ts, lastAt: ts };
 
-    // Phase 1: text-only aggregation
     const text = String(evt.body || '').trim();
-    if (text) {
-      st.items.push({ ts, type: 'text', text });
-    }
+    if (text) st.items.push({ ts, type: 'text', text });
 
     st.lastAt = ts;
     if (!st.openedAt) st.openedAt = ts;
 
     if (st.timer) clearTimeout(st.timer);
-
     const wantsImmediate = text && isFinalizer(text, this.cfg.finalizerWords);
     const delay = wantsImmediate ? 0 : (this.cfg.debounceMs || 30_000);
-
     st.timer = setTimeout(() => this.flushKey(k), delay);
+
     this.map.set(k, st);
   }
 
   async flushKey(k) {
     const st = this.map.get(k);
     if (!st || !st.items.length) return;
-    this.map.delete(k); // prevent double flush
+    this.map.delete(k);
 
     try {
       const [accountId, label, chatId] = k.split('::');
@@ -107,29 +95,24 @@ export class BufferManager {
       });
 
       const ref = this.cfg.paths.threadTurnDoc(this.db, {
-        accountId,
-        label,
-        chatId,
-        windowId: turn.windowId,
+        accountId, label, chatId, windowId: turn.windowId
       });
 
-      await ref.set(
-        {
-          status: 'pending',
-          openedAt: turn.openedAt,
-          closedAt: turn.closedAt,
-          meta: turn.meta,
-          hints: turn.hints,
-          items: turn.items,
-          response: null,
-          processedAt: null,
-          deliveredAt: null,
-          waMessageId: null,
-          error: null,
-        },
-        { merge: true }
-      );
-      // Cloud Function will flip pending → ready.
+      await ref.set({
+        status: 'pending',
+        openedAt: turn.openedAt,
+        closedAt: turn.closedAt,
+        meta: turn.meta,
+        hints: turn.hints,
+        items: turn.items,
+        response: null,
+        processedAt: null,
+        deliveredAt: null,
+        waMessageId: null,
+        error: null
+      }, { merge: true });
+
+      // Cloud Function flips pending → ready
     } catch (e) {
       console.error('[BufferManager.flushKey] write failed', k, e);
     }
