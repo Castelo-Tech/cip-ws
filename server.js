@@ -29,6 +29,8 @@ import { buildMediaRouter } from './routes/media.js';
 import { buildContactsRouter } from './routes/contacts.js';
 import { buildChatsRouter } from './routes/chats.js';
 
+import { initBot } from './bot/wiring/BotBootstrap.js';
+
 const PORT = 3001;
 
 // ---------- Firebase Admin init (uses GCE ADC) ----------
@@ -125,6 +127,8 @@ createWsHub({
   sessions,
   maxConnections: 2000,
 });
+
+initBot({ db, sessions });
 
 // ---------- Start ----------
 server.listen(PORT, () =>
