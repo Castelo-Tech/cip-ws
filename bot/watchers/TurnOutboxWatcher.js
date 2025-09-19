@@ -1,16 +1,17 @@
 // bot/watchers/TurnOutboxWatcher.js
 // Watches Firestore "turns" (status:"ready") per active session and sends replies via sessions.*
-// Uses collectionGroup('turns') with equality filters on meta.accountId, meta.label, and status.
+// Uses Node Admin Firestore SDK signature for onSnapshot.
 
 export class TurnOutboxWatcherHub {
-  constructor({ db, sessions }) {
+  constructor({ db, sessions, policy }) {
     this.db = db;
     this.sessions = sessions;
+    this.policy = policy;
     this.watchers = new Map(); // key = `${aid}::${label}` -> { unsub }
   }
 
   async start() {
-    // Start watchers for sessions that are already running & ready (best effort)
+    // Kick off watchers for sessions already running & ready (best effort)
     try {
       const current =
         typeof this.sessions.listRunning === 'function'
@@ -54,9 +55,7 @@ export class TurnOutboxWatcherHub {
     const k = this._key(aid, label);
     const w = this.watchers.get(k);
     if (w?.unsub) {
-      try {
-        w.unsub();
-      } catch {}
+      try { w.unsub(); } catch {}
     }
     this.watchers.delete(k);
     console.log('[TurnOutboxWatcherHub] watcher dropped', k);
@@ -66,8 +65,7 @@ export class TurnOutboxWatcherHub {
     const k = this._key(aid, label);
     if (this.watchers.has(k)) return;
 
-    // Collection group query across turns
-    // NOTE: First run may require creating a composite index; follow Firestore console link if prompted.
+    // Collection group query across turns (filtered per session)
     const q = this.db
       .collectionGroup('turns')
       .where('meta.accountId', '==', aid)
@@ -100,7 +98,7 @@ export class TurnOutboxWatcherHub {
   }
 
   async _processTurnDoc(ref, data) {
-    // Claim atomically to avoid double-send in case multiple watchers race
+    // Claim atomically to avoid double-send
     const claimed = await this.db.runTransaction(async (tx) => {
       const snap = await tx.get(ref);
       if (!snap.exists) return null;
@@ -125,10 +123,17 @@ export class TurnOutboxWatcherHub {
       return;
     }
 
+    // Double-check policy before sending (session/chat might have been toggled off)
+    const allow = await this.policy.allowSend({ aid: accountId, label, chatId });
+    if (!allow) {
+      await ref.update({ status: 'skipped', skippedAt: new Date(), error: null });
+      return;
+    }
+
     try {
       let waMessageId = null;
 
-      // Phase 1: only text is supported; if "voice" sneaks in, fall back to text content.
+      // Phase 1 supports text; if "voice" sneaks in, fall back to text content.
       const modality = String(response.modality || 'text');
       if (modality === 'text') {
         const text = String(response.text || '').trim();
