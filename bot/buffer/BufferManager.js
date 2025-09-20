@@ -2,21 +2,21 @@
 import { assembleTurn } from './TurnAssembler.js';
 import { isFinalizer } from './MessageHints.js';
 
+const VOICE_TYPES = new Set(['ptt', 'audio', 'voice']); // whatsapp-web.js uses 'ptt' for voice notes
+
 export class BufferManager {
-  constructor({ db, config, policy }) {
+  constructor({ db, config, policy, mediaStore }) {
     this.db = db;
     this.cfg = config;
     this.policy = policy;
+    this.mediaStore = mediaStore;
     this.map = new Map();
     this.gcTimer = null;
   }
 
   keyOf(meta) { return `${meta.accountId}::${meta.label}::${meta.chatId}`; }
 
-  startGC() {
-    if (this.gcTimer) return;
-    this.gcTimer = setInterval(() => this.gcSweep(), 60_000);
-  }
+  startGC() { if (!this.gcTimer) this.gcTimer = setInterval(() => this.gcSweep(), 60_000); }
   stopGC() { if (this.gcTimer) clearInterval(this.gcTimer); this.gcTimer = null; }
 
   gcSweep() {
@@ -31,29 +31,25 @@ export class BufferManager {
     }
   }
 
-  // evt from sessionManager: { accountId, sessionId(label), chatId, fromMe, body, waTimestamp, ... }
+  // evt from sessionManager: { id, accountId, sessionId(label), chatId, fromMe, body, messageType, hasMedia, waTimestamp, mediaUrlPath? }
   push(evt) {
-    // Never react to our own outbound messages
-    if (!evt || evt.fromMe) return;
+    if (!evt || evt.fromMe) return; // never react to our own outbound
 
     const accountId = String(evt.accountId || '');
     const label = String(evt.sessionId || evt.label || '');
     const chatId = String(evt.chatId || '');
     if (!accountId || !label || !chatId) return;
 
-    // For 1:1 chats, inbound sender == chatId
-    const senderWaId = chatId;
-
-    // Gate by policy (session toggle & per-chat opt-out; also ignores same-number)
+    const senderWaId = chatId; // 1:1
     this.policy.allowProcess({ aid: accountId, label, chatId, senderWaId })
-      .then(allow => {
+      .then((allow) => {
         if (!allow) return;
-        this._pushAllowed(evt, { accountId, label, chatId });
+        return this._pushAllowed(evt, { accountId, label, chatId });
       })
-      .catch(e => console.error('[BufferManager] policy.allowProcess error', e));
+      .catch((e) => console.error('[BufferManager] policy.allowProcess error', e));
   }
 
-  _pushAllowed(evt, ids) {
+  async _pushAllowed(evt, ids) {
     const { accountId, label, chatId } = ids;
 
     const tsRaw = Number(evt.waTimestamp || Date.now());
@@ -62,8 +58,29 @@ export class BufferManager {
     const k = this.keyOf({ accountId, label, chatId });
     const st = this.map.get(k) || { items: [], timer: null, openedAt: ts, lastAt: ts };
 
+    // text
     const text = String(evt.body || '').trim();
     if (text) st.items.push({ ts, type: 'text', text });
+
+    // voice note?
+    if (evt.hasMedia && VOICE_TYPES.has(String(evt.messageType || '').toLowerCase())) {
+      try {
+        const saved = await this.mediaStore.saveInboundVoice({
+          accountId, label, chatId,
+          messageId: String(evt.id || ''),
+          waTimestamp: evt.waTimestamp
+        });
+        st.items.push({
+          ts,
+          type: 'voice',
+          gcsUri: saved.gcsUri,
+          contentType: saved.contentType,
+          filename: saved.filename
+        });
+      } catch (e) {
+        console.error('[BufferManager] saveInboundVoice failed', e);
+      }
+    }
 
     st.lastAt = ts;
     if (!st.openedAt) st.openedAt = ts;
@@ -111,8 +128,7 @@ export class BufferManager {
         waMessageId: null,
         error: null
       }, { merge: true });
-
-      // Cloud Function flips pending → ready
+      // AI worker flips pending → ready
     } catch (e) {
       console.error('[BufferManager.flushKey] write failed', k, e);
     }

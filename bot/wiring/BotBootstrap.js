@@ -3,12 +3,14 @@ import { BufferManager } from '../buffer/BufferManager.js';
 import botConfigDefaults from '../../config/botConfig.js';
 import { TurnOutboxWatcherHub } from '../watchers/TurnOutboxWatcher.js';
 import { BotPolicy } from '../policy/BotPolicy.js';
+import { MediaStore } from '../../media/MediaStore.js';
 
 export function initBot({ db, sessions, config = {} }) {
   const cfg = { ...botConfigDefaults, ...config };
   const policy = new BotPolicy({ db });
+  const mediaStore = new MediaStore({ sessions });
 
-  const buffers = new BufferManager({ db, config: cfg, policy });
+  const buffers = new BufferManager({ db, config: cfg, policy, mediaStore });
   buffers.startGC();
 
   sessions.on('evt', (evt) => {

@@ -1,50 +1,47 @@
 // bot/buffer/TurnAssembler.js
-// Assembles buffered items into a Turn doc payload (Phase 1: text-only).
+// Assemble buffered items (text + voice) into a Turn.
 
 import { explicitModality, guessLang } from './MessageHints.js';
 
 export function assembleTurn({ items = [], meta = {}, finalizerWords = [], explicitCfg = {} }) {
-  if (!Array.isArray(items) || items.length === 0) {
-    throw new Error('assembleTurn: empty items');
-  }
+  if (!Array.isArray(items) || items.length === 0) throw new Error('assembleTurn: empty items');
 
-  // Ensure time ordering
   const ordered = [...items].sort((a, b) => (a.ts || 0) - (b.ts || 0));
   const openedAt = ordered[0].ts || Date.now();
   const closedAt = ordered[ordered.length - 1].ts || Date.now();
 
-  // Merge tiny bursts into single lines, keep larger lines separate
-  const SMALL = 14; // chars
-  const merged = [];
+  // merge short text bursts; keep non-text (voice) items in order
+  const SMALL = 14;
+  const out = [];
   let buf = '';
 
   for (const it of ordered) {
-    if (it.type !== 'text') continue; // Phase 1: text only
-    const t = (it.text || '').trim();
-    if (!t) continue;
-
-    if (t.length <= SMALL) {
-      buf = buf ? `${buf} ${t}` : t;
+    if (it.type === 'text') {
+      const t = (it.text || '').trim();
+      if (!t) continue;
+      if (t.length <= SMALL) {
+        buf = buf ? `${buf} ${t}` : t;
+      } else {
+        if (buf) { out.push({ ts: it.ts, type: 'text', text: buf }); buf = ''; }
+        out.push({ ts: it.ts, type: 'text', text: t });
+      }
     } else {
-      if (buf) { merged.push({ ts: it.ts, type: 'text', text: buf }); buf = ''; }
-      merged.push({ ts: it.ts, type: 'text', text: t });
+      // flush pending text before pushing non-text
+      if (buf) { out.push({ ts: it.ts, type: 'text', text: buf }); buf = ''; }
+      // pass-through voice/audio items with their metadata
+      out.push(it);
     }
   }
-  if (buf) merged.push({ ts: closedAt, type: 'text', text: buf });
+  if (buf) out.push({ ts: closedAt, type: 'text', text: buf });
 
-  // Build hints
-  const lastText = merged.length ? merged[merged.length - 1].text : '';
+  // hints
+  const textsOnly = out.filter(i => i.type === 'text').map(i => i.text).join(' ');
   let explicit = null;
-  for (const m of merged) {
-    explicit = explicit || explicitModality(m.text, explicitCfg);
+  for (const m of out) {
+    if (m.type === 'text') explicit = explicit || explicitModality(m.text, explicitCfg);
   }
-  const lang = guessLang(merged.map(m => m.text).join(' ')) || 'es-MX';
-
-  const hints = {
-    lastInbound: 'text',
-    explicit,   // "voice" | "text" | null
-    lang
-  };
+  const lastInbound = out.length ? out[out.length - 1].type : 'text';
+  const lang = guessLang(textsOnly) || 'es-MX';
 
   const windowId = `${meta.accountId}.${meta.label}.${meta.chatId}.${openedAt}`;
 
@@ -58,7 +55,7 @@ export function assembleTurn({ items = [], meta = {}, finalizerWords = [], expli
       chatId: meta.chatId,
       windowId
     },
-    hints,
-    items: merged // [{ ts, type:'text', text }]
+    hints: { lastInbound, explicit, lang },
+    items: out // now includes text + voice entries
   };
 }

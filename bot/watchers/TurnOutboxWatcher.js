@@ -15,9 +15,7 @@ export class TurnOutboxWatcherHub {
       for (const s of current) {
         if (s?.status === 'ready') this._ensureWatcher(s.accountId, s.label);
       }
-    } catch (e) {
-      console.error('[TurnOutboxWatcherHub.start] listRunning failed', e);
-    }
+    } catch (e) { console.error('[TurnOutboxWatcherHub.start] listRunning failed', e); }
 
     this.sessions.on('evt', (evt) => {
       if (!evt) return;
@@ -87,17 +85,24 @@ export class TurnOutboxWatcherHub {
       return;
     }
 
-    // Re-check policy (session could be toggled off mid-flight)
     const allow = await this.policy.allowSend({ aid: accountId, label, chatId });
     if (!allow) { await ref.update({ status: 'skipped', skippedAt: new Date(), error: null }); return; }
 
     try {
       let waMessageId = null;
       const modality = String(response.modality || 'text');
-      const text = String(response.text || '').trim() || 'Mensaje listo (voz no habilitada aún).';
 
-      const msg = await this.sessions.sendText({ accountId, label, to: chatId, text });
-      waMessageId = msg?.id?._serialized || null;
+      if (modality === 'voice' && response.audio?.url) {
+        // send audio, caption = text (if any)
+        const media = { url: response.audio.url };
+        const options = { caption: (response.text || '').trim(), sendAudioAsVoice: true };
+        const msg = await this.sessions.sendMedia({ accountId, label, to: chatId, media, options });
+        waMessageId = msg?.id?._serialized || null;
+      } else {
+        const text = String(response.text || '').trim() || 'Mensaje listo.';
+        const msg = await this.sessions.sendText({ accountId, label, to: chatId, text });
+        waMessageId = msg?.id?._serialized || null;
+      }
 
       await ref.update({ status: 'delivered', deliveredAt: new Date(), waMessageId, error: null });
     } catch (e) {
